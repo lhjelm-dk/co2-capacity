@@ -3014,6 +3014,11 @@ with tabs[1]:
 	
 	# Create and display tornado plot
 	tornado_fig, sensitivities, base_sc, debug_info, grv_mean, ntg_mean, porosity_mean, se_mean, density_mean = create_tornado_plot()
+	
+	# Check if base case storage capacity is zero and warn user
+	if base_sc == 0:
+		st.warning("⚠️ **Warning**: Base case storage capacity is zero. This may indicate that one or more input parameters are zero or invalid. Please check your input parameters.")
+	
 	st.plotly_chart(tornado_fig, use_container_width=True)
 	
 	# Display all debug information in a single expandable box
@@ -3150,18 +3155,29 @@ with tabs[1]:
 	
 	full_range_sensitivities, base_sc_full = create_full_range_sensitivity()
 	
+	# Check if base case storage capacity is zero and warn user
+	if base_sc_full == 0:
+		st.warning("⚠️ **Warning**: Base case storage capacity is zero. This may indicate that one or more input parameters are zero or invalid. Please check your input parameters.")
+	
 	# Display full range sensitivity summary table
 	st.markdown("#### Full Range Sensitivity Summary")
 	
 	# Create full range sensitivity summary table
 	full_range_data = []
 	for sens in full_range_sensitivities:
+		# Calculate relative impact percentage, handling division by zero
+		if base_sc_full != 0:
+			relative_impact = (sens['Range'] / base_sc_full * 100)
+			relative_impact_str = f"{relative_impact:.1f}%"
+		else:
+			relative_impact_str = "N/A"
+		
 		full_range_data.append({
 			'Parameter': sens['Parameter'],
 			'Min Impact (Mt)': f"{sens['Min_Impact']:.2f}",
 			'Max Impact (Mt)': f"{sens['Max_Impact']:.2f}",
 			'Range (Mt)': f"{sens['Range']:.2f}",
-			'Relative Impact (%)': f"{(sens['Range'] / base_sc_full * 100):.1f}%"
+			'Relative Impact (%)': relative_impact_str
 		})
 	
 	full_range_df = pd.DataFrame(full_range_data)
@@ -3178,12 +3194,19 @@ with tabs[1]:
 	# Create sensitivity summary table
 	sensitivity_data = []
 	for sens in sensitivities:
+		# Calculate relative impact percentage, handling division by zero
+		if base_sc != 0:
+			relative_impact = (sens['Range'] / base_sc * 100)
+			relative_impact_str = f"{relative_impact:.1f}%"
+		else:
+			relative_impact_str = "N/A"
+		
 		sensitivity_data.append({
 			'Parameter': sens['Parameter'],
 			'P10 Impact (Mt)': f"{sens['P10_Impact']:.2f}",
 			'P90 Impact (Mt)': f"{sens['P90_Impact']:.2f}",
 			'Range (Mt)': f"{sens['Range']:.2f}",
-			'Relative Impact (%)': f"{(sens['Range'] / base_sc * 100):.1f}%"
+			'Relative Impact (%)': relative_impact_str
 		})
 	
 	sensitivity_df = pd.DataFrame(sensitivity_data)
