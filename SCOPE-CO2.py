@@ -1726,6 +1726,8 @@ with tabs[0]:
 	
 	# Apply GRV_MP to get final GRV
 	sGRV_m3_final = sGRV_m3 * grv_mp_samples
+	# Store in session state for results section
+	st.session_state['sGRV_m3_final'] = sGRV_m3_final
 	
 	# Display final GRV summary
 	st.markdown("---")
@@ -1757,6 +1759,8 @@ with tabs[0]:
 	st.markdown("## Net-to-Gross (NtG)")
 	
 	sNtG = render_param("NtG", "Net-to-Gross NtG", "fraction", defaults["NtG"]["dist"], defaults["NtG"], num_sims, stats_decimals=3)
+	# Store in session state for results section
+	st.session_state['sNtG'] = sNtG
 	
 	# ========================================
 	# SECTION 3: POROSITY
@@ -1765,6 +1769,8 @@ with tabs[0]:
 	st.markdown("## Porosity")
 	
 	sp = render_param("p", "Porosity p", "fraction", defaults["p"]["dist"], defaults["p"], num_sims, stats_decimals=3)
+	# Store in session state for results section
+	st.session_state['sp'] = sp
 	
 	# ========================================
 	# SECTION 4: CO₂ DENSITY
@@ -1816,12 +1822,16 @@ with tabs[0]:
 	if co2_density_method == "Direct distribution input":
 		# Original method - direct distribution input
 		sd = render_param("d", "CO₂ density d", "kg/m³", defaults["d"]["dist"], defaults["d"], num_sims, stats_decimals=2)
+		# Store in session state for results section
+		st.session_state['sd'] = sd
 		co2_phase_info = None
 		
 	else:  # Calculate from Pressure-Temperature
 		if not COOLPROP_AVAILABLE:
 			st.error("CoolProp is required for P-T based CO₂ density calculation. Install with: pip install coolprop")
 			sd = render_param("d", "CO₂ density d", "kg/m³", defaults["d"]["dist"], defaults["d"], num_sims)
+			# Store in session state for results section
+			st.session_state['sd'] = sd
 			co2_phase_info = None
 		else:
 			# P-T calculation method
@@ -1846,6 +1856,8 @@ with tabs[0]:
 				if not np.isnan(density_kg_m3):
 					st.success(f"CO₂ density: {density_kg_m3:.2f} kg/m³ ({phase} phase)")
 					sd = np.full(num_sims, density_kg_m3)
+					# Store in session state for results section
+					st.session_state['sd'] = sd
 					co2_phase_info = np.full(num_sims, phase, dtype=object)
 					
 					# Show density distribution plot for manual input
@@ -1855,6 +1867,8 @@ with tabs[0]:
 				else:
 					st.error("Failed to calculate CO₂ density. Check P-T values.")
 					sd = render_param("d", "CO₂ density d", "kg/m³", defaults["d"]["dist"], defaults["d"], num_sims)
+					# Store in session state for results section
+					st.session_state['sd'] = sd
 					co2_phase_info = None
 					
 			elif pt_calc_method == "P-T distributions":
@@ -1871,6 +1885,8 @@ with tabs[0]:
 				
 				# Calculate density for each P-T sample
 				sd, co2_phase_info = sample_co2_density_from_pt_distributions(sT, sP)
+				# Store in session state for results section
+				st.session_state['sd'] = sd
 				
 				# Check if calculation was successful
 				if np.any(np.isnan(sd)):
@@ -1878,6 +1894,8 @@ with tabs[0]:
 					if nan_count == len(sd):
 						st.error("All CO₂ density calculations failed. Check P-T ranges.")
 						sd = render_param("d", "CO₂ density d", "kg/m³", defaults["d"]["dist"], defaults["d"], num_sims)
+						# Store in session state for results section
+						st.session_state['sd'] = sd
 						co2_phase_info = None
 					else:
 						st.warning(f"CO₂ density calculation failed for {nan_count} out of {len(sd)} samples. Check P-T ranges.")
@@ -1890,6 +1908,8 @@ with tabs[0]:
 						else:
 							st.error("No valid density calculations. Using default distribution.")
 							sd = render_param("d", "CO₂ density d", "kg/m³", defaults["d"]["dist"], defaults["d"], num_sims)
+							# Store in session state for results section
+							st.session_state['sd'] = sd
 							co2_phase_info = None
 				else:
 					st.success(f"Successfully calculated CO₂ density for all {len(sd)} samples")
@@ -2091,6 +2111,9 @@ with tabs[0]:
 						showlegend=False
 					)
 					st.plotly_chart(fig_phase, use_container_width=True)
+				
+				# Store in session state for results section (onshore scenario)
+				st.session_state['sd'] = sd
 					
 			else:  # Offshore scenario
 				# Offshore P-T calculation
@@ -2225,6 +2248,9 @@ with tabs[0]:
 						showlegend=False
 					)
 					st.plotly_chart(fig_phase, use_container_width=True)
+				
+				# Store in session state for results section (offshore scenario)
+				st.session_state['sd'] = sd
 	
 	# ========================================
 	# SECTION 5: STORAGE EFFICIENCY
@@ -2233,6 +2259,8 @@ with tabs[0]:
 	st.markdown("## Storage Efficiency")
 	
 	sSE = render_param("SE", "Storage Efficiency SE", "fraction", defaults["SE"]["dist"], defaults["SE"], num_sims, stats_decimals=3)
+	# Store in session state for results section
+	st.session_state['sSE'] = sSE
 	
 	# ========================================
 	# INPUT SUMMARY TABLE
@@ -2739,8 +2767,14 @@ with tabs[1]:
 			samples_dict['sd'] = sd_correlated
 	
 	# Check if all required variables are available for calculations
+	# Use a more robust approach that doesn't rely on locals()
 	required_vars = ['sGRV_m3_final', 'sNtG', 'sp', 'sSE', 'sd']
-	missing_vars = [var for var in required_vars if var not in locals()]
+	missing_vars = []
+	
+	# Check if variables exist in the current scope or session state
+	for var in required_vars:
+		if var not in locals() and var not in st.session_state:
+			missing_vars.append(var)
 	
 	if missing_vars:
 		st.warning(f"Some required parameters are not yet defined: {', '.join(missing_vars)}. Please complete the input sections first.")
@@ -2752,11 +2786,12 @@ with tabs[1]:
 		sd = np.zeros(num_sims)
 	else:
 		# Extract correlated samples for main calculations
-		sGRV_m3_final = samples_dict.get('sGRV_m3_final', locals().get('sGRV_m3_final'))
-		sNtG = samples_dict.get('sNtG', locals().get('sNtG'))
-		sp = samples_dict.get('sp', locals().get('sp'))
-		sSE = samples_dict.get('sSE', locals().get('sSE'))
-		sd = samples_dict.get('sd', locals().get('sd'))
+		# Try to get from session state first, then locals, then samples_dict
+		sGRV_m3_final = st.session_state.get('sGRV_m3_final', locals().get('sGRV_m3_final', samples_dict.get('sGRV_m3_final')))
+		sNtG = st.session_state.get('sNtG', locals().get('sNtG', samples_dict.get('sNtG')))
+		sp = st.session_state.get('sp', locals().get('sp', samples_dict.get('sp')))
+		sSE = st.session_state.get('sSE', locals().get('sSE', samples_dict.get('sSE')))
+		sd = st.session_state.get('sd', locals().get('sd', samples_dict.get('sd')))
 
 	sPV = sGRV_m3_final * sNtG * sp
 	sSVe = sPV * sSE
