@@ -1,12 +1,12 @@
 import math
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
-from scipy.stats import skew
+from scipy.stats import skew, norm, beta
 
 # CO2 density calculation imports
 try:
@@ -125,46 +125,72 @@ def get_gcf_lookup_table():
 def interpolate_gcf(shape_type, lw_ratio, res_tk_closure_ratio):
     """Interpolate GCF value based on shape type, L/W ratio, and Res Tk/Closure ratio"""
     
-    res_tk_closure_ratios, lookup_table = get_gcf_lookup_table()
-    
-    # Get the appropriate GCF curve
-    if (shape_type, lw_ratio) in lookup_table:
-        gcf_curve = lookup_table[(shape_type, lw_ratio)]
-    else:
-        # For shape type 5 (Block), use L/W=1
-        if shape_type == 5:
-            gcf_curve = lookup_table[(5, 1)]
-        else:
-            # Default to dome if not found
-            gcf_curve = lookup_table[(1, 1)]
-    
-    # Interpolate to find GCF value
-    if res_tk_closure_ratio <= 0:
-        return gcf_curve[0]
-    elif res_tk_closure_ratio >= 1:
-        return gcf_curve[-1]
-    else:
-        # Since res_tk_closure_ratios is in descending order (1.0 to 0.0),
-        # we need to handle the search differently
-        # Find the index where the ratio would be inserted to maintain descending order
-        for i in range(len(res_tk_closure_ratios)):
-            if res_tk_closure_ratios[i] <= res_tk_closure_ratio:
-                idx = i
-                break
-        else:
-            idx = len(res_tk_closure_ratios) - 1
+    try:
+        res_tk_closure_ratios, lookup_table = get_gcf_lookup_table()
         
-        # Handle edge cases
-        if idx == 0:
+        # Validate inputs
+        if not isinstance(shape_type, (int, float)) or not isinstance(lw_ratio, (int, float)):
+            raise ValueError("Shape type and L/W ratio must be numeric")
+        
+        if not isinstance(res_tk_closure_ratio, (int, float)) or np.isnan(res_tk_closure_ratio):
+            raise ValueError("Reservoir thickness/closure ratio must be a valid number")
+        
+        # Get the appropriate GCF curve
+        if (shape_type, lw_ratio) in lookup_table:
+            gcf_curve = lookup_table[(shape_type, lw_ratio)]
+        else:
+            # For shape type 5 (Block), use L/W=1
+            if shape_type == 5:
+                gcf_curve = lookup_table[(5, 1)]
+            else:
+                # Default to dome if not found
+                gcf_curve = lookup_table[(1, 1)]
+        
+        # Interpolate to find GCF value
+        if res_tk_closure_ratio <= 0:
             return gcf_curve[0]
-        elif idx >= len(res_tk_closure_ratios) - 1:
+        elif res_tk_closure_ratio >= 1:
             return gcf_curve[-1]
         else:
-            # Linear interpolation
-            x0, x1 = res_tk_closure_ratios[idx-1], res_tk_closure_ratios[idx]
-            y0, y1 = gcf_curve[idx-1], gcf_curve[idx]
-            return y0 + (y1 - y0) * (res_tk_closure_ratio - x0) / (x1 - x0)
+            # Since res_tk_closure_ratios is in descending order (1.0 to 0.0),
+            # we need to handle the search differently
+            # Find the index where the ratio would be inserted to maintain descending order
+            for i in range(len(res_tk_closure_ratios)):
+                if res_tk_closure_ratios[i] <= res_tk_closure_ratio:
+                    idx = i
+                    break
+            else:
+                idx = len(res_tk_closure_ratios) - 1
+            
+            # Handle edge cases
+            if idx == 0:
+                return gcf_curve[0]
+            elif idx >= len(res_tk_closure_ratios) - 1:
+                return gcf_curve[-1]
+            else:
+                # Linear interpolation
+                x0, x1 = res_tk_closure_ratios[idx-1], res_tk_closure_ratios[idx]
+                y0, y1 = gcf_curve[idx-1], gcf_curve[idx]
+                return y0 + (y1 - y0) * (res_tk_closure_ratio - x0) / (x1 - x0)
 
+    except Exception as e:
+        # Return a default value and log the error
+        print(f"Error in interpolate_gcf: {e}")
+        return 0.5  # Default to middle value
+
+
+# -----------------------------
+# Progress tracking utilities
+# -----------------------------
+
+def update_progress(progress_bar, status_text, current_step, total_steps, message=""):
+	"""Update the progress bar and status text"""
+	progress = current_step / total_steps
+	progress_bar.progress(progress)
+	if message:
+		status_text.text(f"{message} ({current_step}/{total_steps})")
+	else:
+		status_text.text(f"Progress: {current_step}/{total_steps}")
 
 # -----------------------------
 # Sampling utilities
@@ -248,6 +274,819 @@ def sample_beta_subjective(mode_v: float, mean_v: float, min_v: float, max_v: fl
 # Correlation sampling utilities
 # -----------------------------
 
+def sample_dependent_parameters(params_config: Dict[str, Dict[str, Any]], dependencies: Dict[str, float], param_names: List[str], n_samples: int) -> Dict[str, np.ndarray]:
+	"""
+	Sample dependent parameters using conditional sampling approach.
+	
+	Args:
+		params_config: Dictionary of parameter configurations with distribution info
+		dependencies: Dictionary of dependency values between parameter pairs (e.g., {'Area_Thickness': 0.8})
+		param_names: List of parameter names
+		n_samples: Number of samples to generate
+		
+	Returns:
+		Dictionary of dependent parameter samples
+	"""
+	
+	# Start with independent sampling for all parameters
+	dependent_samples = {}
+	
+	# First, sample all parameters independently
+	for param_name in param_names:
+		if param_name not in params_config:
+			raise ValueError(f"Parameter {param_name} not found in configuration")
+		
+		config = params_config[param_name]
+		dist_type = config.get('dist', 'PERT')
+		
+		# Generate independent samples for this parameter
+		if dist_type == 'Uniform':
+			low, high = config['min'], config['max']
+			samples = np.random.uniform(low, high, n_samples)
+			
+		elif dist_type == 'Triangular':
+			low, mode, high = config['min'], config['mode'], config['max']
+			samples = np.random.triangular(low, mode, high, n_samples)
+			
+		elif dist_type == 'PERT':
+			min_v, mode_v, max_v = config['min'], config['mode'], config['max']
+			lam = config.get('lam', 4.0)
+			# Use Beta distribution for PERT
+			alpha = 1.0 + lam * (mode_v - min_v) / (max_v - min_v)
+			beta_param = 1.0 + lam * (max_v - mode_v) / (max_v - min_v)
+			samples = min_v + np.random.beta(alpha, beta_param, n_samples) * (max_v - min_v)
+			
+		elif dist_type == 'Lognormal':
+			mean, sd = config['mean'], config['sd']
+			# Transform to lognormal parameters
+			sigma2 = np.log(1.0 + (sd * sd) / (mean * mean))
+			sigma = np.sqrt(sigma2)
+			mu = np.log(mean) - 0.5 * sigma2
+			samples = np.random.lognormal(mu, sigma, n_samples)
+			
+		elif dist_type == 'Beta Subjective':
+			mode_v, mean_v, min_v, max_v = config['mode'], config['mean'], config['min'], config['max']
+			# Calculate Beta parameters
+			mu = (mean_v - min_v) / (max_v - min_v)
+			mo = (mode_v - min_v) / (max_v - min_v)
+			mu = np.clip(mu, 1e-6, 1 - 1e-6)
+			mo = np.clip(mo, 1e-6, 1 - 1e-6)
+			
+			den = (mu - mo)
+			s = np.where(np.abs(den) < 1e-8, 6.0, (1.0 - 2.0 * mo) / den)
+			s = np.where(s <= 2.0001, 2.0001 + (2.0 - s) + 2.0, s)
+			
+			alpha = mu * s
+			beta_param = s - alpha
+			alpha = np.maximum(alpha, 1e-3)
+			beta_param = np.maximum(beta_param, 1e-3)
+			
+			samples = min_v + np.random.beta(alpha, beta_param, n_samples) * (max_v - min_v)
+			
+		else:
+			raise ValueError(f"Unsupported distribution type: {dist_type}")
+		
+		dependent_samples[param_name] = samples
+	
+	# Now apply dependencies between parameter pairs
+	for dep_key, dep_value in dependencies.items():
+		if abs(dep_value) < 0.01:  # Skip if dependency is essentially zero
+			continue
+			
+		# Parse the dependency key (e.g., 'Area_Thickness' -> ['Area', 'Thickness'])
+		param_pair = dep_key.split('_')
+		if len(param_pair) != 2:
+			continue
+			
+		param1, param2 = param_pair[0], param_pair[1]
+		
+		# Check if both parameters exist
+		if param1 not in dependent_samples or param2 not in dependent_samples:
+			continue
+		
+		# Get the samples for both parameters
+		samples1 = dependent_samples[param1].copy()
+		samples2 = dependent_samples[param2].copy()
+		
+		# Apply dependency: mix dependent and independent sampling
+		# dep_value = 1.0 means 100% dependent, dep_value = 0.0 means 100% independent
+		
+		if abs(dep_value) > 0.99:  # Nearly perfect dependency
+			if dep_value > 0:  # Positive dependency
+				# Sort samples2 in the same order as samples1
+				sorted_indices = np.argsort(samples1)
+				samples2_sorted = np.sort(samples2)
+				samples2 = samples2_sorted[sorted_indices]
+			else:  # Negative dependency
+				# Sort samples2 in opposite order to samples1
+				sorted_indices = np.argsort(samples1)
+				samples2_sorted = np.sort(samples2)[::-1]  # Reverse order
+				samples2 = samples2_sorted[sorted_indices]
+		else:
+			# Partial dependency: mix dependent and independent
+			n_dependent = int(abs(dep_value) * n_samples)
+			n_independent = n_samples - n_dependent
+			
+			if n_dependent > 0:
+				# Apply dependency to first n_dependent samples
+				if dep_value > 0:  # Positive dependency
+					sorted_indices = np.argsort(samples1[:n_dependent])
+					samples2_sorted = np.sort(samples2[:n_dependent])
+					samples2[:n_dependent] = samples2_sorted[sorted_indices]
+				else:  # Negative dependency
+					sorted_indices = np.argsort(samples1[:n_dependent])
+					samples2_sorted = np.sort(samples2[:n_dependent])[::-1]
+					samples2[:n_dependent] = samples2_sorted[sorted_indices]
+			
+			# Keep the remaining samples independent (they're already independent)
+		
+		# Update the samples
+		dependent_samples[param2] = samples2
+	
+	return dependent_samples
+
+
+def sample_correlated(params_config: Dict[str, Dict[str, Any]], corr_matrix: np.ndarray, param_names: List[str], n_samples: int) -> Dict[str, np.ndarray]:
+	"""
+	Generate correlated parameter samples using Cholesky decomposition.
+	
+	This function implements proper correlated sampling for Monte Carlo simulations:
+	1. Generates correlated normal random variables using Cholesky decomposition
+	2. Transforms them to uniform [0,1] values using normal CDF
+	3. Applies inverse CDF (ppf) of each parameter's target distribution
+	
+	Args:
+		params_config: Dictionary of parameter configurations with distribution info
+		corr_matrix: Correlation matrix (must be positive semi-definite)
+		param_names: List of parameter names in the same order as corr_matrix
+		n_samples: Number of samples to generate
+		
+	Returns:
+		Dictionary of correlated parameter samples
+	"""
+	import numpy as np
+	from scipy.stats import norm
+	
+	# Validate correlation matrix
+	if corr_matrix.shape != (len(param_names), len(param_names)):
+		raise ValueError("Correlation matrix dimensions must match number of parameters")
+	
+	# Pre-process correlation matrix to ensure stability
+	# 1. Ensure diagonal elements are exactly 1.0
+	for i in range(len(param_names)):
+		corr_matrix[i, i] = 1.0
+	
+	# 2. Cap off-diagonal elements to prevent perfect correlation
+	for i in range(len(param_names)):
+		for j in range(len(param_names)):
+			if i != j:
+				# Cap at ±0.99 to prevent singular matrices
+				corr_matrix[i, j] = np.clip(corr_matrix[i, j], -0.99, 0.99)
+	
+	# 3. Check if correlation matrix is positive semi-definite
+	try:
+		# Attempt Cholesky decomposition to verify positive semi-definiteness
+		np.linalg.cholesky(corr_matrix)
+	except np.linalg.LinAlgError:
+		# If not positive semi-definite, use eigenvalue adjustment
+		st.warning("⚠️ Correlation matrix is not positive semi-definite. Adjusting eigenvalues to ensure stability.")
+		
+		# Get eigenvalues and eigenvectors
+		eigenvals, eigenvecs = np.linalg.eigh(corr_matrix)
+		
+		# Set negative eigenvalues to small positive values
+		eigenvals = np.maximum(eigenvals, 1e-8)
+		
+		# Reconstruct the matrix
+		corr_matrix = eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
+		
+		# Normalize to ensure diagonal elements are 1.0
+		for i in range(len(param_names)):
+			corr_matrix[i, i] = 1.0
+		
+		# Try Cholesky again
+		try:
+			np.linalg.cholesky(corr_matrix)
+		except np.linalg.LinAlgError:
+			# Final fallback: use identity matrix (no correlations)
+			st.error("❌ Unable to create stable correlation matrix. Using independent sampling.")
+			corr_matrix = np.eye(len(param_names))
+	
+	# Step 1: Generate correlated normal random variables using Cholesky decomposition
+	# Generate independent standard normal random variables
+	z = np.random.standard_normal((len(param_names), n_samples))
+	
+	# Apply Cholesky decomposition: L * L^T = corr_matrix
+	L = np.linalg.cholesky(corr_matrix)
+	
+	# Transform to correlated normal variables: X = L * Z
+	# This gives us correlated standard normal variables
+	correlated_normal = L @ z  # Shape: (n_params, n_samples)
+	
+	# Step 2: Transform correlated normal to uniform [0,1] values using normal CDF
+	# Each column represents one sample across all parameters
+	uniform_samples = norm.cdf(correlated_normal.T)  # Shape: (n_samples, n_params)
+	
+	# Step 3: Apply inverse CDF (ppf) of each parameter's target distribution
+	correlated_samples = {}
+	
+	for i, param_name in enumerate(param_names):
+		if param_name not in params_config:
+			raise ValueError(f"Parameter {param_name} not found in configuration")
+		
+		config = params_config[param_name]
+		dist_type = config.get('dist', 'PERT')
+		
+		# Get uniform values for this parameter (all samples)
+		uniform_values = uniform_samples[:, i]
+		
+		# Apply inverse CDF based on distribution type
+		if dist_type == 'Uniform':
+			low, high = config['min'], config['max']
+			# Direct linear transformation from [0,1] to [low, high]
+			samples = low + uniform_values * (high - low)
+			
+		elif dist_type == 'Triangular':
+			low, mode, high = config['min'], config['mode'], config['max']
+			# Use inverse CDF of triangular distribution
+			# For triangular distribution, we need to handle the two parts separately
+			samples = np.zeros(n_samples)
+			
+			# Split based on mode position
+			mode_pos = (mode - low) / (high - low)
+			
+			# Values below mode position
+			below_mode = uniform_values <= mode_pos
+			if np.any(below_mode):
+				samples[below_mode] = low + np.sqrt(uniform_values[below_mode] * (high - low) * (mode - low))
+			
+			# Values above mode position
+			above_mode = uniform_values > mode_pos
+			if np.any(above_mode):
+				samples[above_mode] = high - np.sqrt((1 - uniform_values[above_mode]) * (high - low) * (high - mode))
+			
+		elif dist_type == 'PERT':
+			min_v, mode_v, max_v = config['min'], config['mode'], config['max']
+			lam = config.get('lam', 4.0)
+			
+			# Use Beta distribution for PERT
+			alpha = 1.0 + lam * (mode_v - min_v) / (max_v - min_v)
+			beta_param = 1.0 + lam * (max_v - mode_v) / (max_v - min_v)
+			
+			# Apply inverse CDF of Beta distribution
+			from scipy.stats import beta
+			samples = min_v + beta.ppf(uniform_values, alpha, beta_param) * (max_v - min_v)
+			
+		elif dist_type == 'Lognormal':
+			mean, sd = config['mean'], config['sd']
+			# Transform to lognormal parameters
+			sigma2 = np.log(1.0 + (sd * sd) / (mean * mean))
+			sigma = np.sqrt(sigma2)
+			mu = np.log(mean) - 0.5 * sigma2
+			
+			# Apply inverse CDF of lognormal distribution
+			from scipy.stats import lognorm
+			samples = lognorm.ppf(uniform_values, sigma, scale=np.exp(mu))
+			
+		elif dist_type == 'Beta Subjective':
+			mode_v, mean_v, min_v, max_v = config['mode'], config['mean'], config['min'], config['max']
+			# Calculate Beta parameters
+			mu = (mean_v - min_v) / (max_v - min_v)
+			mu = np.clip(mu, 1e-6, 1 - 1e-6)
+			mo = (mode_v - min_v) / (max_v - min_v)
+			mo = np.clip(mo, 1e-6, 1 - 1e-6)
+			
+			den = (mu - mo)
+			s = np.where(np.abs(den) < 1e-8, 6.0, (1.0 - 2.0 * mo) / den)
+			s = np.where(s <= 2.0001, 2.0001 + (2.0 - s) + 2.0, s)
+			
+			alpha = mu * s
+			beta_param = s - alpha
+			alpha = np.maximum(alpha, 1e-3)
+			beta_param = np.maximum(beta_param, 1e-3)
+			
+			# Apply inverse CDF of Beta distribution
+			from scipy.stats import beta
+			samples = min_v + beta.ppf(uniform_values, alpha, beta_param) * (max_v - min_v)
+			
+		else:
+			raise ValueError(f"Unsupported distribution type: {dist_type}")
+		
+		correlated_samples[param_name] = samples
+	
+	return correlated_samples
+
+
+def create_dependency_matrix_ui(param_names: List[str], current_dependencies: Dict[str, float] = None) -> Tuple[np.ndarray, Dict[str, float]]:
+	"""
+	Create a user interface for defining parameter dependencies.
+	
+	Args:
+		param_names: List of parameter names
+		current_dependencies: Current dependency values (optional)
+		
+	Returns:
+		Tuple of (dependency_matrix, dependency_dict)
+	"""
+	
+	n_params = len(param_names)
+	
+	# Initialize dependency matrix
+	if current_dependencies is None:
+		current_dependencies = {}
+	
+	# Create dependency matrix UI
+	st.markdown("### Dependency Matrix")
+	st.markdown("Define dependencies between parameters. Values range from -0.99 (strong negative dependency) to +0.99 (strong positive dependency).")
+	st.markdown("**How it works:** Dependency = 0.99 means high values of Parameter A are paired with high values of Parameter B. Dependency = -0.99 means high values of A are paired with low values of B.")
+	
+	# Create a matrix input interface
+	dep_matrix = np.eye(n_params)  # Start with identity matrix (no dependencies)
+	
+	# Create a more user-friendly interface with parameter pairs
+	st.markdown("#### Parameter Pair Dependencies")
+	
+	# Create all possible pairs
+	pairs = []
+	for i in range(n_params):
+		for j in range(i+1, n_params):
+			pairs.append((param_names[i], param_names[j]))
+	
+	# Group pairs into columns for better layout
+	n_cols = 2
+	n_pairs = len(pairs)
+	n_rows = (n_pairs + n_cols - 1) // n_cols
+	
+	for row in range(n_rows):
+		cols = st.columns(n_cols)
+		for col in range(n_cols):
+			pair_idx = row * n_cols + col
+			if pair_idx < n_pairs:
+				param1, param2 = pairs[pair_idx]
+				pair_key = f"{param1}_{param2}"
+				
+				with cols[col]:
+					# Get current dependency value
+					current_value = current_dependencies.get(pair_key, 0.0)
+					
+					# Create slider for this pair
+					dependency = st.slider(
+						f"{param1} ↔ {param2}",
+						min_value=-0.99,
+						max_value=0.99,
+						value=current_value,
+						step=0.01,
+						key=f"dep_matrix_{pair_key}",
+						help=f"Dependency between {param1} and {param2}. Positive = high-high, low-low. Negative = high-low, low-high. Note: Values are capped at ±0.99 to ensure mathematical stability."
+					)
+					
+					# Update dependency matrix
+					idx1 = param_names.index(param1)
+					idx2 = param_names.index(param2)
+					dep_matrix[idx1, idx2] = dependency
+					dep_matrix[idx2, idx1] = dependency  # Symmetric
+					
+					# Store in dependency dict
+					current_dependencies[pair_key] = dependency
+	
+	# Display the dependency matrix as a heatmap
+	st.markdown("#### Dependency Matrix Visualization")
+	
+	# Create heatmap using plotly
+	import plotly.graph_objects as go
+	
+	fig = go.Figure(data=go.Heatmap(
+		z=dep_matrix,
+		x=param_names,
+		y=param_names,
+		colorscale='RdBu',
+		zmid=0,
+		text=np.round(dep_matrix, 2),
+		texttemplate="%{text}",
+		textfont={"size": 10},
+		hoverongaps=False
+	))
+	
+	fig.update_layout(
+		title="Parameter Dependency Matrix",
+		width=600,
+		height=500,
+		xaxis_title="Parameters",
+		yaxis_title="Parameters"
+	)
+	
+	st.plotly_chart(fig, use_container_width=True)
+	
+	return dep_matrix, current_dependencies
+
+
+def create_dependency_matrix_ui_with_scatter_plots(param_names: List[str], current_dependencies: Dict[str, float] = None, all_samples: Dict[str, np.ndarray] = None) -> Tuple[np.ndarray, Dict[str, float]]:
+	"""
+	Create a user interface for defining parameter dependencies with integrated scatter plots.
+	
+	Args:
+		param_names: List of parameter names
+		current_dependencies: Current dependency values (optional)
+		all_samples: Dictionary containing all parameter samples for plotting
+		
+	Returns:
+		Tuple of (dependency_matrix, dependency_dict)
+	"""
+	# Import plotly.graph_objects locally to avoid scope issues
+	import plotly.graph_objects as go
+	
+	n_params = len(param_names)
+	
+	# Initialize dependency matrix
+	if current_dependencies is None:
+		current_dependencies = {}
+	
+	# Create dependency matrix UI
+	st.markdown("### Dependency Matrix")
+	st.markdown("Define dependencies between parameters. Values range from -0.99 (strong negative dependency) to +0.99 (strong positive dependency).")
+	st.markdown("**How it works:** Dependency = 0.99 means high values of Parameter A are paired with high values of Parameter B. Dependency = -0.99 means high values of A are paired with low values of B.")
+	st.markdown("**Note:** Dependencies are automatically applied when you move the sliders. Only non-zero values (≠ 0.00) will affect the sampling.")
+	st.markdown("**Technical Note:** Values are capped at ±0.99 instead of ±1.0 to ensure mathematical stability. Perfect correlation (±1.0) creates singular matrices that cannot be used for Cholesky decomposition.")
+	st.markdown("**Stability:** The system automatically adjusts correlation matrices to ensure mathematical stability and prevent errors.")
+	
+	# Create a matrix input interface
+	dep_matrix = np.eye(n_params)  # Start with identity matrix (no dependencies)
+	# Ensure diagonal elements are 1.0 for proper correlation matrix structure
+	
+	# Create a more user-friendly interface with parameter pairs
+	st.markdown("#### Parameter Pair Dependencies")
+	
+	# Create all possible pairs
+	pairs = []
+	for i in range(n_params):
+		for j in range(i+1, n_params):
+			pairs.append((param_names[i], param_names[j]))
+	
+	# Group pairs into columns for better layout
+	n_cols = 2
+	n_pairs = len(pairs)
+	n_rows = (n_pairs + n_cols - 1) // n_cols
+	
+	# Parameter mapping for sample variables
+	param_mapping = {
+		'Area': 'sA',
+		'GCF': 'sGCF', 
+		'Thickness': 'sh',
+		'NtG': 'sNtG',
+		'Porosity': 'sp',
+		'Storage_Efficiency': 'sSE',
+		'CO2_Density': 'sd'
+	}
+	
+	# Track if any dependency changed to trigger recalculation
+	dependency_changed = False
+	
+	for row in range(n_rows):
+		cols = st.columns(n_cols)
+		for col in range(n_cols):
+			pair_idx = row * n_cols + col
+			if pair_idx < n_pairs:
+				param1, param2 = pairs[pair_idx]
+				pair_key = f"{param1}_{param2}"
+				
+				with cols[col]:
+					# Get current dependency value
+					current_value = current_dependencies.get(pair_key, 0.0)
+					
+					# Create slider for this pair
+					dependency = st.slider(
+						f"{param1} ↔ {param2}",
+						min_value=-0.99,
+						max_value=0.99,
+						value=current_value,
+						step=0.01,
+						key=f"dep_matrix_{pair_key}",
+						help=f"Dependency between {param1} and {param2}. Positive = high-high, low-low. Negative = high-low, low-high. Note: Values are capped at ±0.99 to ensure mathematical stability."
+					)
+					
+					# Check if dependency changed
+					if abs(dependency - current_value) > 0.001:
+						dependency_changed = True
+						# Update current dependencies immediately
+						current_dependencies[pair_key] = dependency
+					
+					# Update dependency matrix
+					idx1 = param_names.index(param1)
+					idx2 = param_names.index(param2)
+					dep_matrix[idx1, idx2] = dependency
+					dep_matrix[idx2, idx1] = dependency  # Symmetric
+					
+					# Add interactive scatter plot under the slider
+					if abs(dependency) > 0.01:  # Only show plot if there's a meaningful dependency
+						st.markdown(f"**{param1} vs {param2} Dependency Visualization**")
+						
+						# Get sample variables
+						sample_var1 = param_mapping.get(param1)
+						sample_var2 = param_mapping.get(param2)
+						
+						if sample_var1 and sample_var2 and all_samples and sample_var1 in all_samples and sample_var2 in all_samples:
+							# Get current samples (which may have been updated by dependency application)
+							current_samples1 = all_samples[sample_var1]
+							current_samples2 = all_samples[sample_var2]
+							
+							# For visualization, we need to show both independent and dependent samples
+							# Since we can't easily get the original independent samples at this point,
+							# we'll generate new independent samples for comparison
+							# Get parameter configurations for this pair
+							param_names_pair = [param1, param2]
+							
+							# Get parameter configurations from session state
+							if 'dependency_matrix_config' in st.session_state:
+								params_config_pair = st.session_state.dependency_matrix_config
+							else:
+								# Fallback: create basic configs for visualization
+								params_config_pair = {
+									param1: {'dist': 'Uniform', 'min': current_samples1.min(), 'max': current_samples1.max()},
+									param2: {'dist': 'Uniform', 'min': current_samples2.min(), 'max': current_samples2.max()}
+								}
+							
+							# Generate independent samples for comparison
+							try:
+								# Create identity correlation matrix (no dependencies)
+								identity_matrix = np.array([[1.0, 0.0], [0.0, 1.0]])
+								independent_samples = sample_correlated(params_config_pair, identity_matrix, param_names_pair, len(current_samples1))
+								indep_samples1 = independent_samples[param1]
+								indep_samples2 = independent_samples[param2]
+							except Exception as e:
+								# Fallback: use current samples as independent samples
+								indep_samples1 = current_samples1.copy()
+								indep_samples2 = current_samples2.copy()
+							
+							# Sample every 50th point for visualization
+							sample_indices = np.arange(0, len(indep_samples1), 50)
+							indep1_sampled = indep_samples1[sample_indices]
+							indep2_sampled = indep_samples2[sample_indices]
+							
+							# Ensure we have enough samples for visualization
+							if len(sample_indices) < 2:
+								st.warning(f"⚠️ Not enough samples for visualization. Need at least 2 samples, got {len(sample_indices)}")
+								continue
+							
+							# Use current samples as dependent samples (these are the correlated samples from the main simulation)
+							dep_samples1 = current_samples1.copy()
+							dep_samples2 = current_samples2.copy()
+							
+							# Sample every 50th point for dependent samples
+							dep1_sampled = dep_samples1[sample_indices]
+							dep2_sampled = dep_samples2[sample_indices]
+							
+							# Check if dependent samples are actually different from independent samples
+							if abs(dependency) > 0.01:
+								sample_diff = np.mean(np.abs(dep1_sampled - indep1_sampled)) + np.mean(np.abs(dep2_sampled - indep2_sampled))
+								if sample_diff < 1e-10:
+									st.warning(f"⚠️ Warning: Dependent samples appear identical to independent samples. This may indicate an issue with correlated sampling.")
+							
+							# Create scatter plot
+							fig_scatter = go.Figure()
+							
+							# Add independent samples (light blue)
+							fig_scatter.add_trace(go.Scatter(
+								x=indep1_sampled,
+								y=indep2_sampled,
+								mode='markers',
+								marker=dict(
+									size=6,
+									color='lightblue',
+									opacity=0.7,
+									line=dict(color='blue', width=1)
+								),
+								name=f'Independent (no dependency)',
+								hovertemplate=f'{param1}: %{{x:.3f}}<br>{param2}: %{{y:.3f}}<br>Independent (no dependency)<extra></extra>'
+							))
+							
+							# Add dependent samples (light red)
+							fig_scatter.add_trace(go.Scatter(
+								x=dep1_sampled,
+								y=dep2_sampled,
+								mode='markers',
+								marker=dict(
+									size=6,
+									color='lightcoral',
+									opacity=0.7,
+									line=dict(color='red', width=1)
+								),
+								name=f'Current (dep={dependency:.2f})',
+								hovertemplate=f'{param1}: %{{x:.3f}}<br>{param2}: %{{y:.3f}}<br>Current (dep={dependency:.2f})<extra></extra>'
+							))
+							
+							# Add trend line for dependent samples
+							if len(dep1_sampled) > 1 and len(dep2_sampled) > 1:
+								z = np.polyfit(dep1_sampled, dep2_sampled, 1)
+								p = np.poly1d(z)
+								trend_x = np.linspace(dep1_sampled.min(), dep1_sampled.max(), 100)
+								trend_y = p(trend_x)
+								
+								fig_scatter.add_trace(go.Scatter(
+									x=trend_x,
+									y=trend_y,
+									mode='lines',
+									line=dict(color='red', width=2, dash='dash'),
+									name=f'Trend (current samples)',
+									showlegend=True
+								))
+							
+							fig_scatter.update_layout(
+								title=f'{param1} vs {param2}',
+								title_x=0.5,
+								xaxis_title=param1,
+								yaxis_title=param2,
+								height=300,
+								showlegend=True,
+								margin=dict(l=30, r=30, t=50, b=30),
+								legend=dict(
+									orientation="h",
+									yanchor="bottom",
+									y=1.02,
+									xanchor="right",
+									x=1
+								)
+							)
+							
+							st.plotly_chart(fig_scatter, use_container_width=True)
+							
+							# Add correlation metrics
+							col1, col2 = st.columns(2)
+							with col1:
+								indep_corr = np.corrcoef(indep1_sampled, indep2_sampled)[0,1]
+								st.metric("Independent Corr", f"{indep_corr:.3f}")
+							with col2:
+								dep_corr = np.corrcoef(dep1_sampled, dep2_sampled)[0,1]
+								st.metric("Current Corr", f"{dep_corr:.3f}")
+							
+							# Add debug info to help identify issues
+							if abs(dependency) > 0.01:
+								st.caption(f"🔍 Debug: Target dependency = {dependency:.3f}, Achieved = {dep_corr:.3f}")
+								if abs(dep_corr - dependency) > 0.1:
+									st.caption(f"⚠️ Warning: Large difference between target ({dependency:.3f}) and achieved ({dep_corr:.3f}) correlation")
+						else:
+							st.info(f"📊 Samples not yet available for {param1} and {param2}. Define parameters first to see dependency visualization.")
+					
+					st.markdown("---")
+	
+	# Display the dependency matrix as a heatmap
+	st.markdown("#### Dependency Matrix Visualization")
+	
+	# Create heatmap using plotly
+	import plotly.graph_objects as go
+	
+	fig = go.Figure(data=go.Heatmap(
+		z=dep_matrix,
+		x=param_names,
+		y=param_names,
+		colorscale='RdBu',
+		zmid=0,
+		text=np.round(dep_matrix, 2),
+		texttemplate="%{text}",
+		textfont={"size": 10},
+		hoverongaps=False
+	))
+	
+	fig.update_layout(
+		title="Parameter Dependency Matrix",
+		width=600,
+		height=500,
+		xaxis_title="Parameters",
+		yaxis_title="Parameters"
+	)
+	
+	st.plotly_chart(fig, use_container_width=True)
+	
+	# If any dependency changed, trigger automatic recalculation
+	if dependency_changed:
+		st.info("🔄 Dependencies updated. Results will be recalculated automatically.")
+		# Force a rerun to apply the new dependencies
+		st.rerun()
+	
+	# Ensure the dependency matrix is a valid correlation matrix
+	# Check if matrix is positive semi-definite and fix if necessary
+	try:
+		# Ensure diagonal elements are exactly 1.0
+		for i in range(n_params):
+			dep_matrix[i, i] = 1.0
+		
+		# Check if matrix is positive semi-definite
+		eigenvals = np.linalg.eigvals(dep_matrix)
+		if np.any(eigenvals < -1e-10):  # Allow small negative values due to numerical precision
+			st.warning("⚠️ Dependency matrix has negative eigenvalues. Adjusting to ensure stability.")
+			# Add small positive values to diagonal to make it positive semi-definite
+			dep_matrix = dep_matrix + np.eye(n_params) * 1e-6
+			# Ensure diagonal is still 1.0
+			for i in range(n_params):
+				dep_matrix[i, i] = 1.0
+		
+		return dep_matrix, current_dependencies
+	except Exception as e:
+		st.error(f"❌ Error validating dependency matrix: {str(e)}")
+		# Return identity matrix as fallback
+		return np.eye(n_params), current_dependencies
+
+
+def validate_dependency_matrix(dep_matrix: np.ndarray, param_names: List[str]) -> Tuple[bool, str]:
+	"""
+	Validate dependency matrix for reasonable values.
+	
+	Args:
+		dep_matrix: Dependency matrix to validate
+		param_names: List of parameter names
+		
+	Returns:
+		Tuple of (is_valid, error_message)
+	"""
+	
+	# Check if matrix is symmetric
+	if not np.allclose(dep_matrix, dep_matrix.T):
+		return False, "Dependency matrix is not symmetric"
+	
+	# Check if diagonal elements are 1
+	if not np.allclose(np.diag(dep_matrix), 1.0):
+		return False, "Diagonal elements of dependency matrix must be 1.0"
+	
+	# Check if off-diagonal elements are in [-0.99, 0.99] (capped to prevent singular matrices)
+	off_diag = dep_matrix[np.triu_indices_from(dep_matrix, k=1)]
+	if np.any(off_diag < -0.99) or np.any(off_diag > 0.99):
+		return False, "Off-diagonal elements must be between -0.99 and 0.99 to ensure mathematical stability"
+	
+	# Check if matrix is positive semi-definite (required for Cholesky decomposition)
+	try:
+		np.linalg.cholesky(dep_matrix)
+	except np.linalg.LinAlgError:
+		# Try to fix the matrix by adjusting eigenvalues
+		try:
+			eigenvals, eigenvecs = np.linalg.eigh(dep_matrix)
+			eigenvals = np.maximum(eigenvals, 1e-8)  # Set negative eigenvalues to small positive values
+			fixed_matrix = eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
+			
+			# Normalize diagonal elements
+			for i in range(len(param_names)):
+				fixed_matrix[i, i] = 1.0
+			
+			# Test if fixed matrix works
+			np.linalg.cholesky(fixed_matrix)
+			return True, "Matrix adjusted for stability"
+		except:
+			return False, "Dependency matrix is not positive semi-definite and cannot be fixed"
+	
+	return True, ""
+
+
+def fix_correlation_matrix(corr_matrix: np.ndarray) -> np.ndarray:
+	"""
+	Fix a correlation matrix to ensure it's positive semi-definite and stable.
+	
+	Args:
+		corr_matrix: Input correlation matrix
+		
+	Returns:
+		Fixed correlation matrix
+	"""
+	import numpy as np
+	
+	# Make a copy to avoid modifying the original
+	fixed_matrix = corr_matrix.copy()
+	
+	# 1. Ensure diagonal elements are exactly 1.0
+	for i in range(fixed_matrix.shape[0]):
+		fixed_matrix[i, i] = 1.0
+	
+	# 2. Cap off-diagonal elements to prevent perfect correlation
+	for i in range(fixed_matrix.shape[0]):
+		for j in range(fixed_matrix.shape[1]):
+			if i != j:
+				fixed_matrix[i, j] = np.clip(fixed_matrix[i, j], -0.99, 0.99)
+	
+	# 3. Check if matrix is positive semi-definite
+	try:
+		np.linalg.cholesky(fixed_matrix)
+		return fixed_matrix
+	except np.linalg.LinAlgError:
+		# Use eigenvalue adjustment to make it positive semi-definite
+		eigenvals, eigenvecs = np.linalg.eigh(fixed_matrix)
+		
+		# Set negative eigenvalues to small positive values
+		eigenvals = np.maximum(eigenvals, 1e-8)
+		
+		# Reconstruct the matrix
+		fixed_matrix = eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
+		
+		# Normalize to ensure diagonal elements are 1.0
+		for i in range(fixed_matrix.shape[0]):
+			fixed_matrix[i, i] = 1.0
+		
+		# Try Cholesky again
+		try:
+			np.linalg.cholesky(fixed_matrix)
+			return fixed_matrix
+		except np.linalg.LinAlgError:
+			# Final fallback: use identity matrix (no correlations)
+			st.warning("⚠️ Unable to create stable correlation matrix. Using independent sampling.")
+			return np.eye(fixed_matrix.shape[0])
+
+
 def apply_correlation(x: np.ndarray, y: np.ndarray, correlation: float) -> Tuple[np.ndarray, np.ndarray]:
 	"""
 	Apply correlation between two arrays using Cholesky decomposition.
@@ -298,54 +1137,6 @@ def apply_correlation(x: np.ndarray, y: np.ndarray, correlation: float) -> Tuple
 	correlated_y = y_sorted[y_indices]
 	
 	return correlated_x, correlated_y
-
-
-def sample_correlated_parameters(param1_config: Dict[str, Any], param2_config: Dict[str, Any], 
-								correlation: float, n: int) -> Tuple[np.ndarray, np.ndarray]:
-	"""
-	Sample two parameters with specified correlation.
-	
-	Args:
-		param1_config: Configuration for first parameter (dist, params)
-		param2_config: Configuration for second parameter (dist, params) 
-		correlation: Correlation coefficient between -1 and 1
-		n: Number of samples
-		
-	Returns:
-		Tuple of (param1_samples, param2_samples)
-	"""
-	# Sample independently first
-	if param1_config["dist"] == "PERT":
-		param1_samples = sample_pert(param1_config["min"], param1_config["mode"], param1_config["max"], n)
-	elif param1_config["dist"] == "Triangular":
-		param1_samples = sample_triangular(param1_config["min"], param1_config["mode"], param1_config["max"], n)
-	elif param1_config["dist"] == "Uniform":
-		param1_samples = sample_uniform(param1_config["min"], param1_config["max"], n)
-	elif param1_config["dist"] == "Lognormal (mean, sd)":
-		param1_samples = sample_lognormal_mean_sd(param1_config["mean"], param1_config["sd"], n)
-	elif param1_config["dist"] == "Subjective Beta (Vose)":
-		param1_samples = sample_beta_subjective(param1_config["mode"], param1_config["mean"], param1_config["min"], param1_config["max"], n)
-	else:
-		param1_samples = np.zeros(n)
-	
-	if param2_config["dist"] == "PERT":
-		param2_samples = sample_pert(param2_config["min"], param2_config["mode"], param2_config["max"], n)
-	elif param2_config["dist"] == "Triangular":
-		param2_samples = sample_triangular(param2_config["min"], param2_config["mode"], param2_config["max"], n)
-	elif param2_config["dist"] == "Uniform":
-		param2_samples = sample_uniform(param2_config["min"], param2_config["max"], n)
-	elif param2_config["dist"] == "Lognormal (mean, sd)":
-		param2_samples = sample_lognormal_mean_sd(param2_config["mean"], param2_config["sd"], n)
-	elif param2_config["dist"] == "Subjective Beta (Vose)":
-		param2_samples = sample_beta_subjective(param2_config["mode"], param2_config["mean"], param2_config["min"], param2_config["max"], n)
-	else:
-		param2_samples = np.zeros(n)
-	
-	# Apply correlation if not zero
-	if abs(correlation) > 1e-6:
-		param1_samples, param2_samples = apply_correlation(param1_samples, param2_samples, correlation)
-	
-	return param1_samples, param2_samples
 
 
 # -----------------------------
@@ -1112,8 +1903,11 @@ def apply_correlations_to_samples(samples_dict: Dict[str, np.ndarray], correlati
 # -----------------------------
 
 st.set_page_config(page_title="CO₂ Storage Capacity", layout="wide")
-st.title("SCOPE-CO₂")
+st.title("SCOPE-CO₂ v.0.8")
 st.subheader("Subsurface Capacity Overview and Probability Estimator for CO₂ storage")
+st.markdown("*by Lars Hjelm*", help="")
+
+
 
 with st.expander("Assumptions and formulas", expanded=False):
 	st.markdown(
@@ -1145,6 +1939,15 @@ st.sidebar.header("Simulation controls")
 num_sims = st.sidebar.number_input("Number of simulations", min_value=100, max_value=2_000_000, value=10_000, step=1000, help="Samples per parameter")
 st.sidebar.caption("Default = 10,000")
 
+# Add performance warning for large simulations
+if num_sims > 100_000:
+	st.sidebar.warning(f"⚠️ Large simulation size ({num_sims:,}) may slow down the application")
+	st.sidebar.info("💡 Consider reducing to 10,000-50,000 for faster results")
+
+# Add progress tracking
+progress_bar = st.sidebar.progress(0)
+status_text = st.sidebar.empty()
+
 defaults = {
 	"A": {"dist": "PERT", "min": 105.0, "mode": 210.0, "max": 273.0},  # km^2
 	"GCF": {"dist": "PERT", "min": 0.6, "mode": 0.68, "max": 0.85},
@@ -1175,6 +1978,9 @@ with tabs[0]:
 		index=1,
 		horizontal=True,
 	)
+	
+	# Store GRV option in session state for dependency matrix logic
+	st.session_state['grv_option'] = grv_option
 
 	if grv_option == "Direct input":
 		grv_min = defaults["A"]["min"] * 1_000_000.0 * defaults["h"]["min"] * defaults["GCF"]["min"]
@@ -1280,16 +2086,44 @@ with tabs[0]:
 					step=0.1,
 					help="Height of closure (spill point to apex) in meters"
 				)
-			
-			with col2:
 				dip_angle = st.number_input(
 					"Dip angle (degrees)",
 					min_value=0.0,
-					max_value=90.0,
-					value=15.0,
+					max_value=89.9,
+					value=0.0,
 					step=0.1,
-					help="Average dip angle of the reservoir"
+					help="Reservoir dip angle in degrees (0° = horizontal, 90° = vertical)"
 				)
+			
+			with col2:
+				# Validate inputs before proceeding
+				if reservoir_thickness <= 0 or structural_relief <= 0:
+					st.error("❌ Reservoir thickness and structural relief must be positive values")
+					st.stop()
+				
+				if dip_angle >= 90:
+					st.error("❌ Dip angle must be less than 90 degrees")
+					st.stop()
+				
+				# Calculate true thickness and ratio
+				dip_radians = math.radians(dip_angle)
+				true_thickness = reservoir_thickness / math.cos(dip_radians)
+				res_tk_closure_ratio = true_thickness / structural_relief
+				
+				# Validate ratio range
+				if res_tk_closure_ratio > 1.0:
+					st.warning(f"⚠️ **Warning**: Reservoir thickness/closure ratio ({res_tk_closure_ratio:.3f}) exceeds 1.0. This may indicate:")
+					st.markdown("""
+					- Reservoir thickness is greater than structural relief
+					- Dip angle correction results in excessive true thickness
+					- Structural relief may be underestimated
+					
+					**Recommendation**: Verify your input parameters or consider adjusting the structural relief value.
+					""")
+				
+				# Display calculated values
+				st.metric("True thickness (m)", f"{true_thickness:.1f}")
+				st.metric("Thickness/Closure ratio", f"{res_tk_closure_ratio:.3f}")
 			
 			# Shape type selection
 			shape_type = st.selectbox(
@@ -1315,12 +2149,6 @@ with tabs[0]:
 					[2, 5, 10],
 					help="Select the length to width ratio for the anticline"
 				)
-			
-			# Calculate Reservoir Thickness/Closure ratio
-			# Apply dip angle correction: true_thickness = measured_thickness / cos(dip_angle)
-			dip_radians = math.radians(dip_angle)
-			true_thickness = reservoir_thickness / math.cos(dip_radians)
-			res_tk_closure_ratio = true_thickness / structural_relief
 			
 			# Calculate GCF using the lookup table
 			gcf_calculated = interpolate_gcf(shape_type[0], lw_ratio, res_tk_closure_ratio)
@@ -1532,46 +2360,137 @@ with tabs[0]:
 			# Create sensitivity plot
 			fig_sens = make_subplots(rows=1, cols=3, subplot_titles=("Reservoir Thickness", "Structural Relief", "Dip Angle"))
 			
+			# Filter out NaN values for plotting
+			valid_thickness_mask = ~np.isnan(gcf_values_thickness)
+			valid_relief_mask = ~np.isnan(gcf_values_relief)
+			valid_dip_mask = ~np.isnan(gcf_values_dip)
+			
 			# Thickness sensitivity
-			fig_sens.add_trace(
-				go.Scatter(x=thickness_range, y=gcf_values_thickness, mode='lines', name='Thickness', line=dict(color='blue')),
-				row=1, col=1
-			)
-			fig_sens.add_trace(
-				go.Scatter(x=[reservoir_thickness], y=[gcf_calculated], mode='markers', name='Current', 
-						  marker=dict(symbol='star', size=12, color='red')),
-				row=1, col=1
-			)
+			if np.any(valid_thickness_mask):
+				fig_sens.add_trace(
+					go.Scatter(
+						x=thickness_range[valid_thickness_mask], 
+						y=np.array(gcf_values_thickness)[valid_thickness_mask], 
+						mode='lines', 
+						name='Thickness', 
+						line=dict(color='blue', width=2),
+						hovertemplate='Thickness: %{x:.1f}m<br>GCF: %{y:.3f}<extra></extra>'
+					),
+					row=1, col=1
+				)
+				fig_sens.add_trace(
+					go.Scatter(
+						x=[reservoir_thickness], 
+						y=[gcf_calculated], 
+						mode='markers', 
+						name='Current', 
+						marker=dict(symbol='star', size=12, color='red'),
+						hovertemplate='Current Thickness: %{x:.1f}m<br>Current GCF: %{y:.3f}<extra></extra>'
+					),
+					row=1, col=1
+				)
+			else:
+				st.warning("⚠️ No valid thickness sensitivity data to plot")
 			
 			# Relief sensitivity
-			fig_sens.add_trace(
-				go.Scatter(x=relief_range, y=gcf_values_relief, mode='lines', name='Relief', line=dict(color='green')),
-				row=1, col=2
-			)
-			fig_sens.add_trace(
-				go.Scatter(x=[structural_relief], y=[gcf_calculated], mode='markers', name='Current', 
-						  marker=dict(symbol='star', size=12, color='red')),
-				row=1, col=2
-			)
+			if np.any(valid_relief_mask):
+				fig_sens.add_trace(
+					go.Scatter(
+						x=relief_range[valid_relief_mask], 
+						y=np.array(gcf_values_relief)[valid_relief_mask], 
+						mode='lines', 
+						name='Relief', 
+						line=dict(color='green', width=2),
+						hovertemplate='Relief: %{x:.1f}m<br>GCF: %{y:.3f}<extra></extra>'
+					),
+					row=1, col=2
+				)
+				fig_sens.add_trace(
+					go.Scatter(
+						x=[structural_relief], 
+						y=[gcf_calculated], 
+						mode='markers', 
+						name='Current', 
+						marker=dict(symbol='star', size=12, color='red'),
+						hovertemplate='Current Relief: %{x:.1f}m<br>Current GCF: %{y:.3f}<extra></extra>'
+					),
+					row=1, col=2
+				)
+			else:
+				st.warning("⚠️ No valid relief sensitivity data to plot")
 			
 			# Dip angle sensitivity
-			fig_sens.add_trace(
-				go.Scatter(x=dip_range, y=gcf_values_dip, mode='lines', name='Dip Angle', line=dict(color='orange')),
-				row=1, col=3
-			)
-			fig_sens.add_trace(
-				go.Scatter(x=[dip_angle], y=[gcf_calculated], mode='markers', name='Current', 
-						  marker=dict(symbol='star', size=12, color='red')),
-				row=1, col=3
+			if np.any(valid_dip_mask):
+				fig_sens.add_trace(
+					go.Scatter(
+						x=dip_range[valid_dip_mask], 
+						y=np.array(gcf_values_dip)[valid_dip_mask], 
+						mode='lines', 
+						name='Dip Angle', 
+						line=dict(color='blue', width=2),
+						hovertemplate='Dip Angle: %{x:.1f}°<br>GCF: %{y:.3f}<extra></extra>'
+					),
+					row=1, col=3
+				)
+				fig_sens.add_trace(
+					go.Scatter(
+						x=[dip_angle], 
+						y=[gcf_calculated], 
+						mode='markers', 
+						name='Current', 
+						marker=dict(symbol='star', size=12, color='red'),
+						hovertemplate='Current Dip: %{x:.1f}°<br>Current GCF: %{y:.3f}<extra></extra>'
+					),
+					row=1, col=3
+				)
+			else:
+				st.warning("⚠️ No valid dip angle sensitivity data to plot")
+			
+			# Update layout with better formatting
+			fig_sens.update_layout(
+				height=450, 
+				showlegend=False,
+				title=dict(
+					text="GCF Sensitivity Analysis",
+					x=0.5,
+					xanchor='center',
+					font=dict(size=16)
+				),
+				margin=dict(t=80, b=60, l=60, r=60)
 			)
 			
-			fig_sens.update_layout(height=400, showlegend=False)
-			fig_sens.update_xaxes(title_text="Reservoir Thickness (m)", row=1, col=1)
-			fig_sens.update_xaxes(title_text="Structural Relief (m)", row=1, col=2)
-			fig_sens.update_xaxes(title_text="Dip Angle (degrees)", row=1, col=3)
-			fig_sens.update_yaxes(title_text="GCF", row=1, col=1)
-			fig_sens.update_yaxes(title_text="GCF", row=1, col=2)
-			fig_sens.update_yaxes(title_text="GCF", row=1, col=3)
+			# Update axes with better formatting
+			fig_sens.update_xaxes(title_text="Reservoir Thickness (m)", row=1, col=1, gridcolor='lightgray', gridwidth=0.5)
+			fig_sens.update_xaxes(title_text="Structural Relief (m)", row=1, col=2, gridcolor='lightgray', gridwidth=0.5)
+			fig_sens.update_xaxes(title_text="Dip Angle (degrees)", row=1, col=3, gridcolor='lightgray', gridwidth=0.5)
+			fig_sens.update_yaxes(title_text="Geometric Correction Factor", row=1, col=1, gridcolor='lightgray', gridwidth=0.5)
+			fig_sens.update_yaxes(title_text="Geometric Correction Factor", row=1, col=2, gridcolor='lightgray', gridwidth=0.5)
+			fig_sens.update_yaxes(title_text="Geometric Correction Factor", row=1, col=3, gridcolor='lightgray', gridwidth=0.5)
+			
+			# Add summary statistics
+			st.markdown("#### Sensitivity Summary")
+			col1, col2, col3 = st.columns(3)
+			
+			with col1:
+				if np.any(valid_thickness_mask):
+					thickness_gcf_range = np.nanmax(gcf_values_thickness) - np.nanmin(gcf_values_thickness)
+					st.metric("Thickness Impact", f"{thickness_gcf_range:.3f}", delta=f"±{thickness_gcf_range/2:.3f}")
+				else:
+					st.metric("Thickness Impact", "N/A")
+			
+			with col2:
+				if np.any(valid_relief_mask):
+					relief_gcf_range = np.nanmax(gcf_values_relief) - np.nanmin(gcf_values_relief)
+					st.metric("Relief Impact", f"{relief_gcf_range:.3f}", delta=f"±{relief_gcf_range/2:.3f}")
+				else:
+					st.metric("Relief Impact", "N/A")
+			
+			with col3:
+				if np.any(valid_dip_mask):
+					dip_gcf_range = np.nanmax(gcf_values_dip) - np.nanmin(gcf_values_dip)
+					st.metric("Dip Angle Impact", f"{dip_gcf_range:.3f}", delta=f"±{dip_gcf_range/2:.3f}")
+				else:
+					st.metric("Dip Angle Impact", "N/A")
 			
 			st.plotly_chart(fig_sens, use_container_width=True)
 		
@@ -1757,6 +2676,7 @@ with tabs[0]:
 	# ========================================
 	st.markdown("---")
 	st.markdown("## Net-to-Gross (NtG)")
+	st.markdown("the ratio of reservoir-quality rock (net) to the total rock interval (gross)")
 	
 	sNtG = render_param("NtG", "Net-to-Gross NtG", "fraction", defaults["NtG"]["dist"], defaults["NtG"], num_sims, stats_decimals=3)
 	# Store in session state for results section
@@ -1767,6 +2687,7 @@ with tabs[0]:
 	# ========================================
 	st.markdown("---")
 	st.markdown("## Porosity")
+	st.markdown("The fraction of a rock's volume that consists of pores. Here, the effective porosity schould be considered as as (1 – Swir), i.e. the pore space available after accounting for irreducible water saturation.")
 	
 	sp = render_param("p", "Porosity p", "fraction", defaults["p"]["dist"], defaults["p"], num_sims, stats_decimals=3)
 	# Store in session state for results section
@@ -1819,6 +2740,9 @@ with tabs[0]:
 		help="Choose how to calculate CO₂ density"
 	)
 	
+	# Store CO2 density method in session state for dependency matrix logic
+	st.session_state['co2_density_method'] = co2_density_method
+	
 	if co2_density_method == "Direct distribution input":
 		# Original method - direct distribution input
 		sd = render_param("d", "CO₂ density d", "kg/m³", defaults["d"]["dist"], defaults["d"], num_sims, stats_decimals=2)
@@ -1841,6 +2765,9 @@ with tabs[0]:
 				horizontal=True,
 				help="Choose how to determine pressure and temperature"
 			)
+			
+			# Store P-T calculation method in session state for dependency matrix logic
+			st.session_state['pt_calc_method'] = pt_calc_method
 			
 			if pt_calc_method == "Manual input":
 				# Manual P-T input
@@ -1998,6 +2925,9 @@ with tabs[0]:
 				# Depth input method
 				onshore_option = st.radio("Depth input method", ["Measured depth (MD) to average unit depth", "Use Ground Level + Depths"], horizontal=True)
 				
+				# Store onshore option in session state for dependency matrix logic
+				st.session_state['onshore_option'] = onshore_option
+				
 				if onshore_option == "Measured depth (MD) to average unit depth":
 					st.markdown("**Depth parameters:**")
 					savgmudline = render_param("avgmudline", "Average mudline depth", "m", "PERT", {"min": 1800.0, "mode": 2000.0, "max": 2200.0}, num_sims)
@@ -2130,6 +3060,9 @@ with tabs[0]:
 				# Depth input method
 				offshore_option = st.radio("Depth input method", ["Use average Mudline + waterdepth", "Use depths only"], horizontal=True)
 				
+				# Store offshore option in session state for dependency matrix logic
+				st.session_state['offshore_option'] = offshore_option
+				
 				if offshore_option == "Use average Mudline + waterdepth":
 					st.markdown("**Depth parameters:**")
 					col1, col2 = st.columns(2)
@@ -2261,6 +3194,112 @@ with tabs[0]:
 	sSE = render_param("SE", "Storage Efficiency SE", "fraction", defaults["SE"]["dist"], defaults["SE"], num_sims, stats_decimals=3)
 	# Store in session state for results section
 	st.session_state['sSE'] = sSE
+	
+	# ========================================
+	# APPLY DEPENDENCIES (if enabled)
+	# ========================================
+	
+	# Apply dependencies using correlated sampling BEFORE main calculations
+	if st.session_state.get('use_dependency_matrix', False) and 'dependency_matrix' in st.session_state:
+		# Use dependency matrix approach with proper correlated sampling
+		st.info("🎯 Applying dependency matrix using correlated sampling")
+		
+		# Get dependency matrix and parameters
+		dep_matrix = st.session_state.dependency_matrix
+		param_names = st.session_state.dependency_matrix_params
+		params_config = st.session_state.dependency_matrix_config
+		
+		# Check if there are any non-zero dependencies
+		has_dependencies = False
+		for i, param1 in enumerate(param_names):
+			for j, param2 in enumerate(param_names):
+				if i < j and abs(dep_matrix[i, j]) > 0.01:  # Only upper triangle, non-zero values
+					has_dependencies = True
+					break
+			if has_dependencies:
+				break
+		
+		if has_dependencies:
+			# Use the new correlated sampling function for proper Monte Carlo correlation
+			try:
+				# Fix the correlation matrix to ensure stability
+				fixed_dep_matrix = fix_correlation_matrix(dep_matrix)
+				correlated_samples = sample_correlated(params_config, fixed_dep_matrix, param_names, num_sims)
+				
+				# Map parameter names back to sample variable names and UPDATE THE ACTUAL VARIABLES
+				# Use the same dynamic parameter checking as in the dependency matrix
+				param_mapping = {}
+				
+				# Build mapping based on available parameters
+				for param_name in available_params:
+					if param_name == 'Area':
+						param_mapping['Area'] = 'sA'
+					elif param_name == 'GCF':
+						param_mapping['GCF'] = 'sGCF'
+					elif param_name == 'Thickness':
+						param_mapping['Thickness'] = 'sh'
+					elif param_name == 'NtG':
+						param_mapping['NtG'] = 'sNtG'
+					elif param_name == 'Porosity':
+						param_mapping['Porosity'] = 'sp'
+					elif param_name == 'Storage_Efficiency':
+						param_mapping['Storage_Efficiency'] = 'sSE'
+					elif param_name == 'CO2_Density':
+						param_mapping['CO2_Density'] = 'sd'
+					elif param_name == 'Temperature':
+						param_mapping['Temperature'] = 'sT'
+					elif param_name == 'Pressure':
+						param_mapping['Pressure'] = 'sP'
+					elif param_name == 'Geothermal_Gradient':
+						param_mapping['Geothermal_Gradient'] = 'sGT_grad'
+					elif param_name == 'Surface_Temperature':
+						param_mapping['Surface_Temperature'] = 'sa_surftemp'
+					elif param_name == 'Seabed_Temperature':
+						param_mapping['Seabed_Temperature'] = 'sa_seabtemp'
+					elif param_name == 'Mudline_Depth':
+						param_mapping['Mudline_Depth'] = 'savgmudline'
+					elif param_name == 'Water_Depth':
+						param_mapping['Water_Depth'] = 'swaterdepth'
+					elif param_name == 'Top_Depth':
+						param_mapping['Top_Depth'] = 'stopdepth'
+					elif param_name == 'Base_Depth':
+						param_mapping['Base_Depth'] = 'sbasedepth'
+					elif param_name == 'Ground_Level':
+						param_mapping['Ground_Level'] = 'sGL'
+				
+				# Update the actual sample variables with correlated samples
+				for param_name, sample_var_name in param_mapping.items():
+					if param_name in correlated_samples:
+						# Update the actual variable in the global scope
+						globals()[sample_var_name] = correlated_samples[param_name]
+						# Also update session state for the main calculation section
+						st.session_state[sample_var_name] = correlated_samples[param_name]
+				
+				# Update derived variables in session state
+				# Only recalculate GRV if Area and Thickness are available (not when direct GRV is used)
+				if 'Area' in correlated_samples and 'Thickness' in correlated_samples:
+					# Calculate GRV with proper unit conversion and GCF factor
+					# This matches the conversion in the main calculation: (sA * 1_000_000.0) * sh * sGCF
+					if 'GCF' in correlated_samples:
+						# Include GCF factor if available
+						sGRV_m3_final = (correlated_samples['Area'] * 1_000_000.0) * correlated_samples['Thickness'] * correlated_samples['GCF']
+					else:
+						# Fallback to basic geometric volume without GCF
+						sGRV_m3_final = (correlated_samples['Area'] * 1_000_000.0) * correlated_samples['Thickness']
+					st.session_state['sGRV_m3_final'] = sGRV_m3_final
+					globals()['sGRV_m3_final'] = sGRV_m3_final
+				elif grv_option == "Direct input":
+					# When direct GRV is used, the GRV is already defined and doesn't need recalculation
+					# The sGRV_m3_final should already be set from the direct GRV input
+					pass
+				
+				st.success(f"✅ Successfully applied correlated sampling to {len([k for k, v in param_mapping.items() if k in correlated_samples])} parameters")
+				
+			except Exception as e:
+				st.error(f"❌ Error in correlated sampling: {str(e)}")
+				st.info("🔄 Falling back to independent sampling for this run")
+		else:
+			st.info("ℹ️ No non-zero dependencies detected. Using independent sampling.")
 	
 	# ========================================
 	# INPUT SUMMARY TABLE
@@ -2399,6 +3438,36 @@ with tabs[0]:
 	st.markdown("---")
 	st.markdown("## Parameter Dependencies/Correlations")
 	st.markdown("Configure correlations between specific parameter pairs to model realistic dependencies in your analysis.")
+	st.markdown("**🚀 Enhanced with Correlated Sampling:** This version now uses Cholesky decomposition to generate mathematically rigorous correlated parameter samples for Monte Carlo simulations.")
+	
+	with st.expander("ℹ️ About Correlation Methods", expanded=False):
+		st.markdown("""
+		**Enhanced Correlation Matrix Approach:**
+		
+		**🚀 Advanced Correlated Sampling (Current Implementation):**
+		- Define correlations between multiple parameters simultaneously
+		- Uses Cholesky decomposition to generate correlated normal random variables
+		- Transforms correlated normals to uniform [0,1] using normal CDF
+		- Applies inverse CDF (ppf) of each parameter's target distribution (PERT, Triangular, Lognormal, etc.)
+		- Provides a heatmap visualization of the correlation matrix
+		- Mathematically rigorous and preserves distribution properties
+		- Automatically ensures correlation matrix is positive semi-definite
+		
+		**Key Benefits:**
+		- **Mathematical Rigor:** Uses proper multivariate normal theory
+		- **Distribution Preservation:** Maintains original parameter distributions
+		- **Stability:** Automatically handles correlation matrix validation
+		- **Performance:** Efficient vectorized operations for large sample sizes
+		
+		**How It Works:**
+		1. Generate independent standard normal random variables
+		2. Apply Cholesky decomposition: L * L^T = correlation_matrix
+		3. Transform to correlated normals: X = L * Z
+		4. Convert to uniform [0,1] using normal CDF
+		5. Apply inverse CDF of target distributions
+		
+		**Recommendation:** This approach provides the most accurate and mathematically sound way to model parameter dependencies in Monte Carlo simulations.
+		""")
 	
 	# Main toggle for parameter dependencies
 	dependencies_enabled = st.checkbox(
@@ -2408,302 +3477,321 @@ with tabs[0]:
 	)
 	
 	if dependencies_enabled:
-		st.info("📊 Parameter correlations will be applied during Monte Carlo sampling to create more realistic parameter relationships.")
+		st.info("📊 Parameter dependencies will be applied during Monte Carlo sampling to create more realistic parameter relationships.")
 		
 		# Create tabs for different dependency categories
 		dependency_tabs = st.tabs([
-			"CO₂ Density Dependencies", 
-			"Depth Dependencies", 
-			"Reservoir Properties", 
-			"Geometry Dependencies"
-		])
-		
-		# Initialize session state for correlation values
-		if 'correlation_values' not in st.session_state:
-			st.session_state.correlation_values = {}
-		
-		# CO₂ Density Dependencies Tab
-		with dependency_tabs[0]:
-			st.markdown("### Temperature and Pressure Correlation")
-			
-			# Check if CO2 density P-T distribution is selected
-			pt_density_selected = (co2_density_method == "Calculate from Pressure-Temperature" and 
-								  'pt_calc_method' in locals() and pt_calc_method == "P-T distributions")
-			
-			if pt_density_selected:
-				st.success("✅ Temperature and Pressure correlation available (P-T distributions selected)")
-				
-				# Temperature-Pressure correlation slider
-				st.session_state.correlation_values['temp_pressure'] = st.slider(
-					"Temperature-Pressure correlation coefficient",
-					min_value=-1.0,
-					max_value=1.0,
-					value=st.session_state.correlation_values.get('temp_pressure', 0.0),
-					step=0.01,
-					key="corr_temp_pressure",
-					help="Correlation between Temperature and Pressure"
-				)
-				
-				# Show correlation scatter plot
-				if abs(st.session_state.correlation_values['temp_pressure']) > 0.01:
-					st.markdown("**Temperature vs Pressure Correlation Plot**")
-					# Apply correlation temporarily for visualization
-					sT_temp, sP_temp = apply_correlation(sT.copy(), sP.copy(), st.session_state.correlation_values['temp_pressure'])
-					scatter_fig = create_correlation_scatter_plot(
-						sT_temp, sP_temp, 
-						"Temperature T", "Pressure P", 
-						st.session_state.correlation_values['temp_pressure']
-					)
-					st.plotly_chart(scatter_fig, use_container_width=True)
-				
-				# Note: CO2 density will be recalculated in the main calculation section with correlated P-T values
-			else:
-				st.warning("⚠️ Temperature-Pressure correlation requires 'Calculate from Pressure-Temperature' → 'P-T distributions' to be selected")
-				st.session_state.correlation_values['temp_pressure'] = 0.0
-		
-		# Depth Dependencies Tab
-		with dependency_tabs[1]:
-			st.markdown("### Top Depth and Base Depth Correlation")
-			
-			# Check if depth-based GRV calculation is selected
-			depth_grv_selected = (grv_option == "From Depth/Top/Base Areas (table)" or 
-								 grv_option == "Depth vs Area vs Thickness (spill-point)")
-			
-			if depth_grv_selected:
-				st.success("✅ Top Depth and Base Depth correlation available (depth-based GRV calculation selected)")
-				
-				# Top Depth-Base Depth correlation slider
-				st.session_state.correlation_values['top_base_depth'] = st.slider(
-					"Top Depth-Base Depth correlation coefficient",
-					min_value=-1.0,
-					max_value=1.0,
-					value=st.session_state.correlation_values.get('top_base_depth', 0.0),
-					step=0.01,
-					key="corr_top_base_depth",
-					help="Correlation between Top Depth and Base Depth"
-				)
-				
-				# Show correlation scatter plot
-				if abs(st.session_state.correlation_values['top_base_depth']) > 0.01:
-					st.markdown("**Top Depth vs Base Depth Correlation Plot**")
-					# Get depth samples from session state
-					current_stopdepth_off = st.session_state.get('stopdepth_off_samples', np.array([]))
-					current_sbasedepth_off = st.session_state.get('sbasedepth_off_samples', np.array([]))
-					
-					if current_stopdepth_off.size > 0 and current_sbasedepth_off.size > 0:
-						# Apply correlation temporarily for visualization
-						stopdepth_temp, sbasedepth_temp = apply_correlation(current_stopdepth_off.copy(), current_sbasedepth_off.copy(), st.session_state.correlation_values['top_base_depth'])
-						scatter_fig = create_correlation_scatter_plot(
-							stopdepth_temp, sbasedepth_temp, 
-							"Top Depth", "Base Depth", 
-							st.session_state.correlation_values['top_base_depth']
-						)
-						st.plotly_chart(scatter_fig, use_container_width=True)
-					else:
-						st.warning("Cannot plot Top Depth vs Base Depth correlation: samples not available. Please select a depth-based GRV calculation method and ensure inputs are valid.")
-			else:
-				st.warning("⚠️ Top Depth-Base Depth correlation requires depth-based GRV calculation to be selected")
-				st.session_state.correlation_values['top_base_depth'] = 0.0
-		
-		# Reservoir Properties Tab
-		with dependency_tabs[2]:
-			st.markdown("### Reservoir Property Correlations")
-			
-			# Porosity and Storage Efficiency correlation
-			st.markdown("#### Porosity and Storage Efficiency")
-			
-			# Porosity-Storage Efficiency correlation slider
-			st.session_state.correlation_values['porosity_se'] = st.slider(
-				"Porosity-Storage Efficiency correlation coefficient",
-				min_value=-1.0,
-				max_value=1.0,
-				value=st.session_state.correlation_values.get('porosity_se', 0.0),
-				step=0.01,
-				key="corr_porosity_se",
-				help="Correlation between Porosity and Storage Efficiency"
-			)
-			
-						# Show correlation scatter plot
-			if abs(st.session_state.correlation_values['porosity_se']) > 0.01:
-				st.markdown("**Porosity vs Storage Efficiency Correlation Plot**")
-				# Apply correlation temporarily for visualization
-				sp_temp, sSE_temp = apply_correlation(sp.copy(), sSE.copy(), st.session_state.correlation_values['porosity_se'])
-				scatter_fig = create_correlation_scatter_plot(
-					sp_temp, sSE_temp, 
-					"Porosity p", "Storage Efficiency SE",
-					st.session_state.correlation_values['porosity_se']
-				)
-				st.plotly_chart(scatter_fig, use_container_width=True)
-			
-			# Porosity and Net-to-Gross correlation
-			st.markdown("#### Porosity and Net-to-Gross")
-			
-			# Porosity-Net-to-Gross correlation slider
-			st.session_state.correlation_values['porosity_ntg'] = st.slider(
-				"Porosity-Net-to-Gross correlation coefficient",
-				min_value=-1.0,
-				max_value=1.0,
-				value=st.session_state.correlation_values.get('porosity_ntg', 0.0),
-				step=0.01,
-				key="corr_porosity_ntg",
-				help="Correlation between Porosity and Net-to-Gross"
-			)
-			
-			# Show correlation scatter plot
-			if abs(st.session_state.correlation_values['porosity_ntg']) > 0.01:
-				st.markdown("**Porosity vs Net-to-Gross Correlation Plot**")
-				# Apply correlation temporarily for visualization
-				sp_temp, sNtG_temp = apply_correlation(sp.copy(), sNtG.copy(), st.session_state.correlation_values['porosity_ntg'])
-				scatter_fig = create_correlation_scatter_plot(
-					sp_temp, sNtG_temp, 
-					"Porosity p", "Net-to-Gross NtG", 
-					st.session_state.correlation_values['porosity_ntg']
-				)
-				st.plotly_chart(scatter_fig, use_container_width=True)
-		
-		# Geometry Dependencies Tab
-		with dependency_tabs[3]:
-			st.markdown("### Geometry Factor Correlations")
-			
-			# Check if GRV Area, Geometry Factor and Thickness is selected
-			geometry_dependencies_available = (grv_option == "From Area, Geometry Factor and Thickness")
-			
-			if geometry_dependencies_available:
-				st.success("✅ Geometry factor correlations available")
-				
-				# Thickness and GCF correlation
-				st.markdown("#### Thickness and Geometry Correction Factor (GCF)")
-				
-				# Thickness-GCF correlation slider
-				st.session_state.correlation_values['thickness_gcf'] = st.slider(
-					"Thickness-GCF correlation coefficient",
-					min_value=-1.0,
-					max_value=1.0,
-					value=st.session_state.correlation_values.get('thickness_gcf', 0.0),
-					step=0.01,
-					key="corr_thickness_gcf",
-					help="Correlation between Thickness and Geometry Correction Factor"
-				)
-				
-				# Show correlation scatter plot
-				if abs(st.session_state.correlation_values['thickness_gcf']) > 0.01:
-					st.markdown("**Thickness vs GCF Correlation Plot**")
-					# Apply correlation temporarily for visualization
-					sh_temp, sGCF_temp = apply_correlation(sh.copy(), sGCF.copy(), st.session_state.correlation_values['thickness_gcf'])
-					scatter_fig = create_correlation_scatter_plot(
-						sh_temp, sGCF_temp, 
-						"Thickness h", "Geometry Correction Factor GCF", 
-						st.session_state.correlation_values['thickness_gcf']
-					)
-					st.plotly_chart(scatter_fig, use_container_width=True)
-				
-				# Area and GCF correlation
-				st.markdown("#### Area and Geometry Correction Factor (GCF)")
-				
-				# Area-GCF correlation slider
-				st.session_state.correlation_values['area_gcf'] = st.slider(
-					"Area-GCF correlation coefficient",
-					min_value=-1.0,
-					max_value=1.0,
-					value=st.session_state.correlation_values.get('area_gcf', 0.0),
-					step=0.01,
-					key="corr_area_gcf",
-					help="Correlation between Area and Geometry Correction Factor"
-				)
-				
-				# Show correlation scatter plot
-				if abs(st.session_state.correlation_values['area_gcf']) > 0.01:
-					st.markdown("**Area vs GCF Correlation Plot**")
-					# Apply correlation temporarily for visualization
-					sA_temp, sGCF_temp = apply_correlation(sA.copy(), sGCF.copy(), st.session_state.correlation_values['area_gcf'])
-					scatter_fig = create_correlation_scatter_plot(
-						sA_temp, sGCF_temp, 
-						"Area A", "Geometry Correction Factor GCF", 
-						st.session_state.correlation_values['area_gcf']
-					)
-					st.plotly_chart(scatter_fig, use_container_width=True)
-			else:
-				st.warning("⚠️ Geometry factor correlations require 'From Area, Geometry Factor and Thickness' to be selected")
-				st.session_state.correlation_values['thickness_gcf'] = 0.0
-				st.session_state.correlation_values['area_gcf'] = 0.0
-		
-		# Summary of all correlations
-		st.markdown("---")
-		st.markdown("### Correlation Summary")
-		
-		# Create correlation summary table
-		correlation_summary = []
-		
-		# Add available correlations to summary
-		if pt_density_selected:
-			correlation_summary.append({
-				"Parameter Pair": "Temperature ↔ Pressure",
-				"Correlation": f"{st.session_state.correlation_values.get('temp_pressure', 0.0):.2f}",
-				"Status": "✅ Active"
-			})
-		
-		if depth_grv_selected:
-			correlation_summary.append({
-				"Parameter Pair": "Top Depth ↔ Base Depth",
-				"Correlation": f"{st.session_state.correlation_values.get('top_base_depth', 0.0):.2f}",
-				"Status": "✅ Active"
-			})
-		
-		correlation_summary.extend([
-			{
-				"Parameter Pair": "Porosity ↔ Storage Efficiency",
-				"Correlation": f"{st.session_state.correlation_values.get('porosity_se', 0.0):.2f}",
-				"Status": "✅ Active"
-			},
-			{
-				"Parameter Pair": "Porosity ↔ Net-to-Gross",
-				"Correlation": f"{st.session_state.correlation_values.get('porosity_ntg', 0.0):.2f}",
-				"Status": "✅ Active"
-			}
-		])
-		
-		if geometry_dependencies_available:
-			correlation_summary.extend([
-				{
-					"Parameter Pair": "Thickness ↔ GCF",
-					"Correlation": f"{st.session_state.correlation_values.get('thickness_gcf', 0.0):.2f}",
-					"Status": "✅ Active"
-				},
-				{
-					"Parameter Pair": "Area ↔ GCF",
-					"Correlation": f"{st.session_state.correlation_values.get('area_gcf', 0.0):.2f}",
-					"Status": "✅ Active"
-				}
-			])
-		
-		# Display correlation summary table
-		if correlation_summary:
-			corr_df = pd.DataFrame(correlation_summary)
-			st.dataframe(corr_df, use_container_width=True)
-		else:
-			st.info("No correlations are currently active. Select appropriate input methods to enable correlations.")
-		
-		# Success message about implementation
-		st.markdown("---")
-		st.success("""
-		**✅ Correlation Implementation Complete:** Parameter correlations are now fully implemented in the Monte Carlo sampling. 
-		When you adjust correlation coefficients, the underlying distributions are recalculated and the scatter plots update dynamically.
-		""")
+		"Dependency Matrix"
+	])
 	
-	else:
+	# Initialize session state for dependency values
+	if 'dependency_values' not in st.session_state:
+		st.session_state.dependency_values = {}
+	
+	# Initialize session state for dependency matrix
+	if 'dependency_matrix_values' not in st.session_state:
+		st.session_state.dependency_matrix_values = {}
+	
+	# Initialize session state for correlation values
+	if 'correlation_values' not in st.session_state:
+		st.session_state.correlation_values = {}
+	
+	# Get available parameters for dependency matrix (moved outside tabs for shared access)
+	available_params = []
+	params_config = {}
+	
+	# Get the current GRV option from session state
+	grv_option = st.session_state.get('grv_option', 'From Area, Geometry Factor and Thickness')
+	
+	# Get the current CO2 density method from session state
+	co2_density_method = st.session_state.get('co2_density_method', 'Direct distribution input')
+	
+	# Function to check if a parameter is actually being used based on input methods
+	def is_parameter_used(param_name, grv_opt, co2_method):
+		"""
+		Check if a parameter is actually being used based on the selected input methods.
+		
+		Args:
+			param_name: Name of the parameter to check
+			grv_opt: Selected GRV input method
+			co2_method: Selected CO2 density input method
+		
+		Returns:
+			bool: True if parameter is used, False otherwise
+		"""
+		# GRV group parameters
+		if param_name in ['Area', 'GCF', 'Thickness']:
+			if grv_opt == "Direct input":
+				return False  # These are not used when direct GRV is selected
+			elif grv_opt == "From Area, Geometry Factor and Thickness":
+				return True   # These are directly used
+			elif grv_opt == "From Depth/Top/Base Areas (table)":
+				return False  # These are not used, GRV comes from table
+			elif grv_opt == "Depth vs Area vs Thickness (spill-point)":
+				return False  # These are not used, GRV comes from depth-area-thickness calculation
+			else:
+				return False
+		
+		# CO2 density parameters
+		elif param_name == 'CO2_Density':
+			if co2_method == "Direct distribution input":
+				return True   # Direct distribution is used
+			elif co2_method == "Calculate from Pressure-Temperature":
+				return False  # CO2 density is calculated from P-T, not directly sampled
+			else:
+				return False
+		
+		# Temperature and Pressure parameters (only used in P-T method)
+		elif param_name in ['Temperature', 'Pressure']:
+			if co2_method == "Calculate from Pressure-Temperature":
+				return True   # These are used in P-T calculation
+			else:
+				return False
+		
+		# Geothermal parameters (only used in onshore/offshore scenarios)
+		elif param_name in ['Geothermal_Gradient', 'Surface_Temperature', 'Seabed_Temperature']:
+			if co2_method == "Calculate from Pressure-Temperature":
+				# Check if onshore/offshore scenarios are selected
+				pt_calc_method = st.session_state.get('pt_calc_method', 'Manual input')
+				if pt_calc_method in ['Onshore scenario', 'Offshore scenario']:
+					return True
+			return False
+		
+		# Depth parameters (only used in onshore/offshore scenarios)
+		elif param_name in ['Mudline_Depth', 'Water_Depth', 'Top_Depth', 'Base_Depth', 'Ground_Level']:
+			if co2_method == "Calculate from Pressure-Temperature":
+				pt_calc_method = st.session_state.get('pt_calc_method', 'Manual input')
+				if pt_calc_method in ['Onshore scenario', 'Offshore scenario']:
+					return True
+			return False
+		
+		# Always used parameters
+		elif param_name in ['NtG', 'Porosity', 'Storage_Efficiency']:
+			return True
+		
+		# Default case
+		else:
+			return False
+	
+	# Add parameters that are currently defined and actually used
+	# When direct GRV is used, exclude Area, GCF, and Thickness from dependencies
+	if grv_option != "Direct input":
+		if 'sA' in locals() and is_parameter_used('Area', grv_option, co2_density_method):
+			available_params.append('Area')
+			params_config['Area'] = {'dist': 'PERT', 'min': defaults['A']['min'], 'mode': defaults['A']['mode'], 'max': defaults['A']['max']}
+		if 'sGCF' in locals() and is_parameter_used('GCF', grv_option, co2_density_method):
+			available_params.append('GCF')
+			params_config['GCF'] = {'dist': 'PERT', 'min': defaults['GCF']['min'], 'mode': defaults['GCF']['mode'], 'max': defaults['GCF']['max']}
+		if 'sh' in locals() and is_parameter_used('Thickness', grv_option, co2_density_method):
+			available_params.append('Thickness')
+			params_config['Thickness'] = {'dist': 'PERT', 'min': defaults['h']['min'], 'mode': defaults['h']['min'], 'max': defaults['h']['max']}
+	
+	# Always include these parameters regardless of GRV option (but check if they're actually used)
+	if 'sNtG' in locals() and is_parameter_used('NtG', grv_option, co2_density_method):
+		available_params.append('NtG')
+		params_config['NtG'] = {'dist': 'PERT', 'min': defaults['NtG']['min'], 'mode': defaults['NtG']['mode'], 'max': defaults['NtG']['max']}
+	if 'sp' in locals() and is_parameter_used('Porosity', grv_option, co2_density_method):
+		available_params.append('Porosity')
+		params_config['Porosity'] = {'dist': 'PERT', 'min': defaults['p']['min'], 'mode': defaults['p']['mode'], 'max': defaults['p']['max']}
+	if 'sSE' in locals() and is_parameter_used('Storage_Efficiency', grv_option, co2_density_method):
+		available_params.append('Storage_Efficiency')
+		params_config['Storage_Efficiency'] = {'dist': 'PERT', 'min': defaults['SE']['min'], 'mode': defaults['SE']['mode'], 'max': defaults['SE']['max']}
+	
+	# CO2 density parameters - check if they're actually used based on method
+	if 'sd' in locals() and is_parameter_used('CO2_Density', grv_option, co2_density_method):
+		available_params.append('CO2_Density')
+		params_config['CO2_Density'] = {'dist': 'PERT', 'min': defaults['d']['min'], 'mode': defaults['d']['mode'], 'max': defaults['d']['max']}
+	
+	# Add P-T parameters if they're being used
+	if co2_density_method == "Calculate from Pressure-Temperature":
+		pt_calc_method = st.session_state.get('pt_calc_method', 'Manual input')
+		
+		if pt_calc_method == "P-T distributions":
+			if 'sT' in locals() and is_parameter_used('Temperature', grv_option, co2_density_method):
+				available_params.append('Temperature')
+				params_config['Temperature'] = {'dist': 'PERT', 'min': 300.0, 'mode': 325.0, 'max': 350.0}
+			if 'sP' in locals() and is_parameter_used('Pressure', grv_option, co2_density_method):
+				available_params.append('Pressure')
+				params_config['Pressure'] = {'dist': 'PERT', 'min': 20.0, 'mode': 27.0, 'max': 35.0}
+		
+		elif pt_calc_method in ['Onshore scenario', 'Offshore scenario']:
+			# Add geothermal parameters
+			if 'sGT_grad' in locals() and is_parameter_used('Geothermal_Gradient', grv_option, co2_density_method):
+				available_params.append('Geothermal_Gradient')
+				params_config['Geothermal_Gradient'] = {'dist': 'PERT', 'min': 25.0, 'mode': 30.0, 'max': 35.0}
+			
+			if pt_calc_method == "Onshore scenario":
+				if 'sa_surftemp' in locals() and is_parameter_used('Surface_Temperature', grv_option, co2_density_method):
+					available_params.append('Surface_Temperature')
+					params_config['Surface_Temperature'] = {'dist': 'PERT', 'min': 285.0, 'mode': 288.0, 'max': 291.0}
+				
+				# Add depth parameters based on onshore option
+				onshore_option = st.session_state.get('onshore_option', 'Measured depth (MD) to average unit depth')
+				if onshore_option == "Measured depth (MD) to average unit depth":
+					if 'savgmudline' in locals() and is_parameter_used('Mudline_Depth', grv_option, co2_density_method):
+						available_params.append('Mudline_Depth')
+						params_config['Mudline_Depth'] = {'dist': 'PERT', 'min': 1800.0, 'mode': 2000.0, 'max': 2200.0}
+				else:  # Use Ground Level + Depths
+					if 'sGL' in locals() and is_parameter_used('Ground_Level', grv_option, co2_density_method):
+						available_params.append('Ground_Level')
+						params_config['Ground_Level'] = {'dist': 'PERT', 'min': -10.0, 'mode': 0.0, 'max': 10.0}
+					if 'stopdepth' in locals() and is_parameter_used('Top_Depth', grv_option, co2_density_method):
+						available_params.append('Top_Depth')
+						params_config['Top_Depth'] = {'dist': 'PERT', 'min': 1800.0, 'mode': 2000.0, 'max': 2200.0}
+					if 'sbasedepth' in locals() and is_parameter_used('Base_Depth', grv_option, co2_density_method):
+						available_params.append('Base_Depth')
+						params_config['Base_Depth'] = {'dist': 'PERT', 'min': 1850.0, 'mode': 2050.0, 'max': 2250.0}
+			
+			elif pt_calc_method == "Offshore scenario":
+				if 'sa_seabtemp' in locals() and is_parameter_used('Seabed_Temperature', grv_option, co2_density_method):
+					available_params.append('Seabed_Temperature')
+					params_config['Seabed_Temperature'] = {'dist': 'PERT', 'min': 275.0, 'mode': 278.0, 'max': 281.0}
+				
+				# Add depth parameters based on offshore option
+				offshore_option = st.session_state.get('offshore_option', 'Use average Mudline + waterdepth')
+				if offshore_option == "Use average Mudline + waterdepth":
+					if 'savgmudline' in locals() and is_parameter_used('Mudline_Depth', grv_option, co2_density_method):
+						available_params.append('Mudline_Depth')
+						params_config['Mudline_Depth'] = {'dist': 'PERT', 'min': 1800.0, 'mode': 2000.0, 'max': 2200.0}
+					if 'swaterdepth' in locals() and is_parameter_used('Water_Depth', grv_option, co2_density_method):
+						available_params.append('Water_Depth')
+						params_config['Water_Depth'] = {'dist': 'PERT', 'min': 80.0, 'mode': 100.0, 'max': 120.0}
+				else:  # Use depths only
+					if 'stopdepth' in locals() and is_parameter_used('Top_Depth', grv_option, co2_density_method):
+						available_params.append('Top_Depth')
+						params_config['Top_Depth'] = {'dist': 'PERT', 'min': 1800.0, 'mode': 2000.0, 'max': 2200.0}
+					if 'sbasedepth' in locals() and is_parameter_used('Base_Depth', grv_option, co2_density_method):
+						available_params.append('Base_Depth')
+						params_config['Base_Depth'] = {'dist': 'PERT', 'min': 1850.0, 'mode': 2050.0, 'max': 2250.0}
+	
+	# Dependency Matrix Tab
+	if dependencies_enabled:
+		with dependency_tabs[0]:
+			st.markdown("### Advanced Dependency Matrix")
+			st.markdown("Define dependencies between multiple parameters simultaneously using a dependency matrix approach.")
+			st.markdown("**New:** This version uses proper correlated sampling with Cholesky decomposition for mathematically rigorous Monte Carlo simulations.")
+			
+			if len(available_params) >= 2:
+				st.info(f"📊 {len(available_params)} parameters available for dependency matrix: {', '.join(available_params)}")
+				
+				# Debug info: Show why parameters are included/excluded
+				with st.expander("🔍 Dependency Matrix Debug Info", expanded=False):
+					st.markdown("**Parameter Availability Analysis:**")
+					st.markdown(f"- **GRV Input Method:** {grv_option}")
+					st.markdown(f"- **CO2 Density Method:** {co2_density_method}")
+					
+					if co2_density_method == "Calculate from Pressure-Temperature":
+						pt_calc_method = st.session_state.get('pt_calc_method', 'Not selected')
+						st.markdown(f"- **P-T Calculation Method:** {pt_calc_method}")
+						
+						if pt_calc_method in ['Onshore scenario', 'Offshore scenario']:
+							if pt_calc_method == "Onshore scenario":
+								onshore_option = st.session_state.get('onshore_option', 'Not selected')
+								st.markdown(f"- **Onshore Option:** {onshore_option}")
+							elif pt_calc_method == "Offshore scenario":
+								offshore_option = st.session_state.get('offshore_option', 'Not selected')
+								st.markdown(f"- **Offshore Option:** {offshore_option}")
+					
+					st.markdown("**Parameter Status:**")
+					for param_name in ['Area', 'GCF', 'Thickness', 'NtG', 'Porosity', 'Storage_Efficiency', 'CO2_Density']:
+						if param_name in available_params:
+							st.markdown(f"✅ **{param_name}:** Available for dependencies")
+						else:
+							st.markdown(f"❌ **{param_name}:** Not available for dependencies")
+					
+					# Show P-T specific parameters if applicable
+					if co2_density_method == "Calculate from Pressure-Temperature":
+						pt_calc_method = st.session_state.get('pt_calc_method', 'Not selected')
+						if pt_calc_method == "P-T distributions":
+							for param_name in ['Temperature', 'Pressure']:
+								if param_name in available_params:
+									st.markdown(f"✅ **{param_name}:** Available for dependencies")
+								else:
+									st.markdown(f"❌ **{param_name}:** Not available for dependencies")
+						
+						elif pt_calc_method in ['Onshore scenario', 'Offshore scenario']:
+							for param_name in ['Geothermal_Gradient', 'Surface_Temperature', 'Seabed_Temperature', 'Mudline_Depth', 'Water_Depth', 'Top_Depth', 'Base_Depth', 'Ground_Level']:
+								if param_name in available_params:
+									st.markdown(f"✅ **{param_name}:** Available for dependencies")
+								else:
+									st.markdown(f"❌ **{param_name}:** Not available for dependencies")
+				
+				# Collect all available parameter samples into a dictionary for dependency visualization
+				current_samples_for_plotting = {}
+				
+				# Add samples for parameters that are actually available and used
+				for param_name in available_params:
+					if param_name == 'Area' and 'sA' in locals():
+						current_samples_for_plotting['sA'] = sA
+					elif param_name == 'GCF' and 'sGCF' in locals():
+						current_samples_for_plotting['sGCF'] = sGCF
+					elif param_name == 'Thickness' and 'sh' in locals():
+						current_samples_for_plotting['sh'] = sh
+					elif param_name == 'NtG' and 'sNtG' in locals():
+						current_samples_for_plotting['sNtG'] = sNtG
+					elif param_name == 'Porosity' and 'sp' in locals():
+						current_samples_for_plotting['sp'] = sp
+					elif param_name == 'Storage_Efficiency' and 'sSE' in locals():
+						current_samples_for_plotting['sSE'] = sSE
+					elif param_name == 'CO2_Density' and 'sd' in locals():
+						current_samples_for_plotting['sd'] = sd
+					elif param_name == 'Temperature' and 'sT' in locals():
+						current_samples_for_plotting['sT'] = sT
+					elif param_name == 'Pressure' and 'sP' in locals():
+						current_samples_for_plotting['sP'] = sP
+					elif param_name == 'Geothermal_Gradient' and 'sGT_grad' in locals():
+						current_samples_for_plotting['sGT_grad'] = sGT_grad
+					elif param_name == 'Surface_Temperature' and 'sa_surftemp' in locals():
+						current_samples_for_plotting['sa_surftemp'] = sa_surftemp
+					elif param_name == 'Seabed_Temperature' and 'sa_seabtemp' in locals():
+						current_samples_for_plotting['sa_seabtemp'] = sa_seabtemp
+					elif param_name == 'Mudline_Depth' and 'savgmudline' in locals():
+						current_samples_for_plotting['savgmudline'] = savgmudline
+					elif param_name == 'Water_Depth' and 'swaterdepth' in locals():
+						current_samples_for_plotting['swaterdepth'] = swaterdepth
+					elif param_name == 'Top_Depth' and 'stopdepth' in locals():
+						current_samples_for_plotting['stopdepth'] = stopdepth
+					elif param_name == 'Base_Depth' and 'sbasedepth' in locals():
+						current_samples_for_plotting['sbasedepth'] = sbasedepth
+					elif param_name == 'Ground_Level' and 'sGL' in locals():
+						current_samples_for_plotting['sGL'] = sGL
+				
+				# Create dependency matrix UI
+				dep_matrix, dep_dict = create_dependency_matrix_ui_with_scatter_plots(available_params, st.session_state.dependency_matrix_values, current_samples_for_plotting)
+				
+				# Validate dependency matrix
+				is_valid, error_msg = validate_dependency_matrix(dep_matrix, available_params)
+				
+				if is_valid:
+					# Store dependency matrix in session state
+					st.session_state.dependency_matrix = dep_matrix
+					st.session_state.dependency_matrix_params = available_params
+					st.session_state.dependency_matrix_config = params_config
+					st.session_state.dependency_matrix_values = dep_dict
+					st.session_state.use_dependency_matrix = True
+					
+					st.info("🎯 Dependencies will be automatically applied during Monte Carlo sampling.")
+				else:
+					st.error(f"❌ Dependency matrix is invalid: {error_msg}")
+					st.session_state.dependency_matrix = None
+					st.session_state.use_dependency_matrix = False
+			else:
+				st.warning("⚠️ At least 2 parameters must be defined to use dependency matrix")
+				st.session_state.dependency_matrix = None
+				st.session_state.use_dependency_matrix = False
+		
+
+
+
+
+
+	if not st.session_state.get('use_dependency_matrix', False):
 		st.info("🔒 Parameter dependencies are disabled. All parameters will be sampled independently.")
 
 with tabs[1]:
 	st.subheader("Result distributions")
 	
-	# Add recalculate all button
-	if st.button("🔄 Recalculate All Distributions", type="primary", help="Recalculate all distributions with current input parameters"):
-		# Clear session state to force recalculation
-		for key in list(st.session_state.keys()):
-			if key.startswith("samples_") or key.startswith("conf_") or key.startswith("corr_"):
-				del st.session_state[key]
-		# Keep correlation values so they are applied to new distributions
-		st.rerun()
+
 
 	# Apply correlations to all parameter samples before main calculations
 	# Collect all available parameter samples into a dictionary
@@ -2736,35 +3824,7 @@ with tabs[1]:
 	if 'sGRV_m3_final' in locals():
 		samples_dict['sGRV_m3_final'] = sGRV_m3_final
 
-	# Apply correlations if correlation values exist
-	if 'correlation_values' in st.session_state and st.session_state.correlation_values:
-		samples_dict = apply_correlations_to_samples(samples_dict, st.session_state.correlation_values, num_sims)
-		
-		# Recalculate CO2 density if P-T correlations were applied
-		if ('temp_pressure' in st.session_state.correlation_values and 
-			abs(st.session_state.correlation_values['temp_pressure']) > 0.01 and
-			'sT' in samples_dict and 'sP' in samples_dict):
-			# Recalculate CO2 density with correlated P-T values
-			sd_correlated, co2_phase_info_correlated = sample_co2_density_from_pt_distributions(
-				samples_dict['sT'], samples_dict['sP']
-			)
-			
-			# Check if calculation was successful
-			if np.any(np.isnan(sd_correlated)):
-				nan_count = np.sum(np.isnan(sd_correlated))
-				if nan_count == len(sd_correlated):
-					st.error("All CO₂ density calculations failed with correlated P-T. Check P-T ranges.")
-				else:
-					st.warning(f"CO₂ density calculation failed for {nan_count} out of {len(sd_correlated)} samples with correlated P-T. Check P-T ranges.")
-					# Replace NaN values with mean of valid values
-					valid_densities = sd_correlated[~np.isnan(sd_correlated)]
-					if len(valid_densities) > 0:
-						mean_density = np.mean(valid_densities)
-						sd_correlated = np.where(np.isnan(sd_correlated), mean_density, sd_correlated)
-						st.info(f"Replaced {nan_count} failed calculations with mean density: {mean_density:.2f} kg/m³")
-			
-			# Update the samples dictionary with the new density
-			samples_dict['sd'] = sd_correlated
+	# Dependencies are now applied earlier in the code, before main calculations
 	
 	# Check if all required variables are available for calculations
 	# Use a more robust approach that doesn't rely on locals()
@@ -2792,6 +3852,36 @@ with tabs[1]:
 		sp = st.session_state.get('sp', locals().get('sp', samples_dict.get('sp')))
 		sSE = st.session_state.get('sSE', locals().get('sSE', samples_dict.get('sSE')))
 		sd = st.session_state.get('sd', locals().get('sd', samples_dict.get('sd')))
+		
+		# Debug: Check if we're using correlated samples
+		if hasattr(st.session_state, 'dependency_matrix') and st.session_state.dependency_matrix is not None:
+			# Check if any dependencies are non-zero
+			has_deps = False
+			if hasattr(st.session_state, 'dependency_matrix_params'):
+				param_names = st.session_state.dependency_matrix_params
+				dep_matrix = st.session_state.dependency_matrix
+				for i, param1 in enumerate(param_names):
+					for j, param2 in enumerate(param_names):
+						if i < j and abs(dep_matrix[i, j]) > 0.01:
+							has_deps = True
+							break
+					if has_deps:
+						break
+			
+			if has_deps:
+				# Show which dependencies are active
+				active_deps = []
+				for i, param1 in enumerate(param_names):
+					for j, param2 in enumerate(param_names):
+						if i < j and abs(dep_matrix[i, j]) > 0.01:
+							active_deps.append(f"{param1}-{param2}: {dep_matrix[i, j]:.2f}")
+				
+				if active_deps:
+					st.info(f"🔗 Using correlated samples with dependencies: {', '.join(active_deps)}")
+				else:
+					st.info("🔗 Using correlated samples from dependency matrix in main calculations")
+			else:
+				st.info("📊 Using independent samples in main calculations")
 
 	sPV = sGRV_m3_final * sNtG * sp
 	sSVe = sPV * sSE
@@ -2833,8 +3923,7 @@ with tabs[1]:
 	# TORNADO PLOT FOR SENSITIVITY ANALYSIS
 	# ========================================
 	st.markdown("---")
-	st.markdown("## Sensitivity Analysis - Tornado Plot")
-	st.markdown("This plot shows how each input parameter affects the mean storage capacity value.")
+	st.markdown("## Sensitivity Analysis")
 	
 	# Add violin plot for storage capacity
 	st.markdown("### Storage Capacity Distribution Analysis")
@@ -2862,6 +3951,9 @@ with tabs[1]:
 	)
 	
 	st.plotly_chart(fig_violin, use_container_width=True)
+	
+	st.markdown("### Tornado plot")
+	st.markdown("This plot shows how each input parameter affects the mean storage capacity value.")
 	
 	# Function to create tornado plot
 	def create_tornado_plot():
