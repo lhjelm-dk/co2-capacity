@@ -3231,7 +3231,7 @@ with tabs[0]:
 				param_mapping = {}
 				
 				# Build mapping based on available parameters
-				for param_name in available_params:
+				for param_name in param_names:
 					if param_name == 'Area':
 						param_mapping['Area'] = 'sA'
 					elif param_name == 'GCF':
